@@ -1,54 +1,79 @@
-下面详细讲解 `VocabParallelEmbedding` 类的实现，它是 vLLM 中用于**张量并行（Tensor Parallelism）** 的嵌入层，核心作用是将词汇表维度（`vocab_size`）切分到多个 GPU 上，同时支持**原始词汇 + LoRA 添加词汇**的混合布局，并处理填充对齐。
+# VocabParallelEmbedding —— 词表并行嵌入
 
----
+**文件路径：** `vllm/model_executor/layers/vocab_parallel_embedding.py`
 
-## 1. 类概述与设计背景
+## 1. 模块定位
 
-### 1.1 为什么需要词汇表并行？
-- 大型语言模型的词汇表通常很大（例如 128k、256k）。如果每个 GPU 都保存完整的嵌入矩阵，会浪费大量显存。
-- 张量并行将嵌入矩阵沿 **词汇表维度** 切分，每个 GPU 只保存一部分词嵌入向量。前向传播时，根据输入的 token id 选择对应的 GPU 进行计算，最后通过 all‑reduce 聚合结果。
+- **职责：** 实现词表切分的嵌入层（ColumnParallel），每个 TP rank 持有词汇表的一个分片，避免整个词表被复制到所有 GPU。
+- **上游调用者：** `DeepseekV4Model` 的 `embed_tokens` 层和 MTP 的 `embed_tokens` 层。
+- **下游消费者：** `ParallelLMHead`（子类），`LogitsProcessor`（消费 `lm_head` 的输出）。
 
-### 1.2 处理 LoRA 添加词汇
-- 为了支持 LoRA 等扩展，模型可能会在原始词汇表后面**动态添加**一些新的 token（例如特殊标记）。这些添加的词汇也需要被分片并存储在同一个嵌入张量中。
-- 同时，为了满足底层内核（如 FP8 矩阵乘、FlashAttention）的对齐要求，词汇表大小通常需要 **填充（padding）** 到某个倍数（例如 64、128 或 256）。
+## 2. 词表并行策略
 
-### 1.3 整体布局策略
-类注释中给出了详细的示例布局。总结如下：
-- 原始词汇表（BASE）先填充到对齐边界（`org_vocab_size_padded`）。
-- 添加词汇表（LORA）紧跟在填充后的原始词汇表之后。
-- 整个词汇表（BASE 填充 + LORA）再整体填充到对齐边界（`num_embeddings_padded`）。
-- 在 TP 切分时，每个 rank 获得一段连续的区间，区间内包含：有效原始词汇（可能不足）、填充、有效添加词汇、填充。**填充总是位于每个分片的尾部**（即每个 rank 的本地张量中，有效原始词汇在开头，有效添加词汇紧接着原始词汇的末尾，其余全是填充）。
+### 嵌入查表（`embedding` 模式）
 
-这样做的好处：
-- 添加词汇在全局中始终排在原始词汇之后，便于 LoRA 动态扩展。
-- 填充只在分片内部进行，不改变全局 token id 的顺序。
-- 每个 rank 的本地张量形状一致（`[num_embeddings_per_partition, hidden_size]`），便于并行计算。
+- **分片方式：** 嵌入权重按词表维度切分。每个 rank 持有 `vocab_size // tp_size` 个 token 的嵌入向量。
+- **前向传播：** `nn.Embedding` 的列并行——输入 token ID 直接查本地表，超出本地范围的 ID 查不到（应为零）。
+- **TP 通信：** 前向传播中的 `all_reduce` 聚合各 rank 的部分嵌入（`EmbeddingAllReduce` 算子）。这使得每个 rank 的输出形状已经是 `[num_tokens, hidden_size]`，后续计算无需额外通信。
+- **设计意图：** 嵌入层占参数量不大（`vocab_size × hidden_size`），但 TP 切分后可减少 HBM 带宽占用。对于大词表模型（如 128K+），节省显著。
 
----
-## 2 简要说明
-`VocabParallelEmbedding` 的核心是**将词嵌入矩阵按词汇维度切分到多个 GPU**，实现模型并行。关键设计：
+### 逻辑回归（`lm_head` 模式，即 `ParallelLMHead`）
 
-1. **填充与分片**  
-   - 原始词表 + LoRA 添加词表各自按 `padding_size` 填充，再整体均匀切分到各 GPU。  
-   - 每个 GPU 持有**原始段 + 添加段**两块连续数据（内部保留填充），全局视角是不连续的拼接。
+`ParallelLMHead` 继承 `VocabParallelEmbedding` 并设置 `quant_method` 为 `"apply"` 模式，此时：
+- **前向传播：** 执行 `quant_method.apply`（FP8 量化矩阵乘）替代嵌入查表。
+- **TP 通信：** `LogitsProcessor` 在 `apply` 后执行 `gather` 而非 `all_reduce`（因为词表切分后需要收集所有分片才能得到完整 logits）。
+- **参见 [[ParallelLMHead]] 和 [[LogitsProcessor]]。**
 
-2. **前向映射**  
-   - 输入 token_id 通过 `get_masked_input_and_mask` 判断归属：  
-     - 若在当前 GPU 的原始段或添加段内，映射为**局部索引**查表；  
-     - 否则置掩码（输出 0）。
-   - 各 GPU 查表后执行 `all_reduce` 求和，得到完整嵌入。
+## 3. DeepSeek V4 中的特殊处理
 
-3. **优势**  
-   - 支持动态添加词元（LoRA）而无需重新分配原始段。  
-   - 填充保证切分均匀，通信量平衡。  
-   - 掩码+all-reduce 实现精确的分布式查找。
----
+### MTP 共享嵌入
 
-## 3. 总结
+DeepSeek V4 的 MTP（Multi-Token Prediction）draft 模型使用独立的 `VocabParallelEmbedding` 实例（`mtp.py:L199-L203`）：
 
-`VocabParallelEmbedding` 是一个精心设计的并行嵌入层，核心思想是：
-- 将词汇表（原始 + 添加）填充对齐后均匀切分到多个 GPU。
-- 每个 GPU 只保存自己的分片，并处理映射和掩码。
-- 前向传播时，每个 GPU 只负责属于自己分片的 token，输出零值给其他 token，最后通过 all‑reduce 合并。
+```python
+self.embed_tokens = VocabParallelEmbedding(
+    config.vocab_size,
+    config.hidden_size,
+    prefix=maybe_prefix(prefix, "embed_tokens"),
+)
+```
 
-这种设计使得 LLM 能够高效处理超大型词汇表，同时为 LoRA 扩展和量化提供了良好的支持。该实现已在 vLLM 中用于 Llama、DeepSeek 等众多模型。
+这个嵌入层与目标模型的 `embed_tokens` 是**独立的参数**（不是权重绑定），在 MTP checkpoint 中独立存储，通过 `_rewrite_spec_layer_name`（`mtp.py:L481`）将共享权重提升到顶层命名空间。
+
+### 量化配置的传递
+
+`VocabParallelEmbedding` 的 `quant_config` 来自 `VllmConfig`，最终由 [[DeepseekV4FP8Config]] 控制。嵌入层使用 `Fp8LinearMethod`（embedding 模式），而 `lm_head` 使用 `Fp8LinearMethod`（apply 模式），两者由 `quant_method` 属性区分。
+
+## 4. 对外接口
+
+```python
+class VocabParallelEmbedding(nn.Module):
+    def __init__(self, vocab_size, hidden_size, ...):
+        # 按 TP 切分词表
+        self.weight = nn.Parameter(...)  # shape: [vocab_size // tp_size, hidden_size]
+
+    def forward(self, input_ids):
+        # 嵌入查表 + all_reduce
+        return output  # [num_tokens, hidden_size]
+```
+
+## 5. 关键 tensor
+
+| 变量 | shape | dtype | 说明 |
+|------|-------|-------|------|
+| `weight` | `(vocab_size // tp_size, hidden_size)` | bf16/fp8 | 切分后的嵌入矩阵 |
+| `input_ids` | `(num_tokens,)` | int64 | 输入 token ID |
+| output | `(num_tokens, hidden_size)` | bf16 | `all_reduce` 后的完整嵌入 |
+
+## 6. 设计亮点
+
+- **统一的分片基类**：同一份权重可以既作嵌入（查表）又作输出投影（`lm_head`），通过 `quant_method` 区分行为模式。
+- **TP 通信隐藏**：`all_reduce` 被封装在 `forward` 中，上层（`DeepseekV4Model`）感知不到通信开销。
+- **MTP 权重的命名隔离**：MTP 的 `embed_tokens` 通过 `prefix` 区分命名空间，与主模型权重互不干扰。
+
+## Cross-References
+
+- [[ParallelLMHead]]：子类，用于 `lm_head` 输出投影
+- [[LogitsProcessor]]：消费 `ParallelLMHead` 的输出，执行 TP gather
+- [[QuantAndParallelStrategy]]：`quant_method` 在嵌入层和 `lm_head` 中的不同角色（`embedding` vs `apply`），以及 TP 通信模式（all-reduce vs gather）对整体推理性能的影响。
+- [[MTP]]：MTP 中独立的 `embed_tokens` 实例

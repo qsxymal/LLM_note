@@ -142,3 +142,89 @@
 - 压缩器 `DeepseekCompressor` 内部可能依赖 `k_cache_prefix` 来找到对应的缓存区域，这种依赖通过字符串前缀耦合，可考虑改为显式引用。
 
 以上设计充分体现了 **稀疏注意力系统中索引器模块的高性能实现**，兼顾了算法需求（压缩、RoPE、量化）与工程落地（并行、内存布局、硬件对齐）。
+
+---
+
+## 8. 源码行号标注
+
+> 以下行号基于 `vllm/models/deepseek_v4/attention.py`。
+
+### 8.1 关键方法行号汇总
+
+| 类 / 方法 | 文件行号 | 说明 |
+|-----------|---------|------|
+| `DeepseekV4IndexerCache.__init__` | L730-749 | 初始化，注册到 `static_forward_context` |
+| `DeepseekV4IndexerCache.get_kv_cache_spec` | L751-763 | 返回缓存规格（alignment=576） |
+| `DeepseekV4IndexerCache.get_attn_backend` | L767-768 | 返回 `DeepseekV4IndexerBackend` |
+| `DeepseekV4Indexer.__init__` | L771-873 | 初始化所有子模块 |
+| `DeepseekV4Indexer.forward` | L876-910 | 前向传播主流程 |
+
+### 8.2 `DeepseekV4IndexerCache` 中 kv_cache 的 Shape/Dtype 计算
+
+`DeepseekV4IndexerCache` 的缓存规格由 `get_kv_cache_spec` 方法决定（L751-763）：
+
+```python
+def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    return MLAAttentionSpec(
+        block_size=self.cache_config.block_size,    # 由 cache_config 决定
+        num_kv_heads=1,                              # 单 KV head（MQA 风格）
+        head_size=self.head_dim,                     # 由初始化参数决定
+        dtype=self.dtype,                            # torch.uint8（量化后）
+        compress_ratio=self.compress_ratio,
+        alignment=576,                               # 576B 对齐
+    )
+```
+
+实际的 `head_dim` 在 `DeepseekV4Indexer.__init__` 中计算（L837）：
+
+```python
+k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+```
+
+对于 `head_dim=128`, `quant_block_size=128`：
+- 原始 head_dim = 128（FP8 数据）
+- scale 占用 = 128 // 128 * 4 = 4 字节
+- `k_cache_head_dim = 128 + 4 = 132`
+
+因此 kv_cache 的最终 shape：
+| 维度 | 值 | 说明 |
+|------|----|------|
+| `num_blocks` | 由调度器根据 `max_model_len // compress_ratio` 分配 | 块数量 |
+| `block_size` | `cache_config.block_size` | 每个块的 token 数 |
+| `head_size` | 132 | 128 FP8 数据 + 4 字节 scale |
+
+**FP4 情况**（`use_fp4_kv=True`）：虽然 MXFP4 格式的占用量是 FP8 的一半，但代码注释明确说明 "still allocate the same amount of memory as FP8, but only use the first half"（L835-836），保持布局一致以简化寻址。
+
+---
+
+## 9. 设计决策思考
+
+### 9.1 为什么 `alignment=576`？
+
+`alignment=576` 的要求出现在两个地方：
+1. `DeepseekV4IndexerCache.get_kv_cache_spec()` (L762)
+2. `CompressorStateCache.get_kv_cache_spec()` (compressor.py L164)
+
+```python
+alignment=576,  # NOTE: FlashMLA requires 576B alignment
+```
+
+**根本原因：FlashMLA 内核要求 KV 缓存页（page）按 576 字节对齐。**
+
+具体来说：
+
+1. **FlashMLA 的缓存行大小**：DeepSeek-V4 的 FP8 缓存格式使用 584 字节/token（448 NoPE + 128 RoPE + 8 字节 scale），其中 NoPE 部分是 FP8（448B），RoPE 部分是 BF16（128B），scale 是 8B。FlashMLA 的 block_size=256 意味着每个块大小为 256 × 584 = 149,504 字节。FlashMLA 内部使用 576B 作为内存访问的基本对齐单元，这与 CUDA 的内存合并访问（coalesced access）和共享内存 bank 冲突避免策略有关。
+
+2. **与压缩器状态缓存的打包**：注释特别说明（L760-761）："DeepseekV4 aligns indexer pages to FlashMLA's 576B so they can pack with the indexer's compressor state cache." 这意味着索引器的 K cache 可以与压缩器的 state cache 共享同一块连续物理内存，FlashMLA 的 576B 对齐要求保证了两种缓存可以无缝地在同一内存区域排列。
+
+3. **576 的数值来源**：576 = 448 (nope_head_dim fp8) + 128 (rope_head_dim × 2 bf16)。这是 FlashMLA 中每个 token 的最小对齐单位。虽然实际每 token 存储 584B（576 + 8B scale），但对齐按 576B 进行，8B scale 作为额外填充处理。
+
+4. **V3.2 的兼容性**：代码注释（L761）说明 "V3.2 keeps the legacy layout"，即 V3.2 不使用 576B 对齐。这是因为 V3.2 的 indexer 没有与压缩器共用物理内存的需求，可以保持传统布局以保证向后兼容。
+
+---
+
+## 10. 交叉引用
+
+- [[DeepseekV4MultiHeadLatentAttentionWrapper]]：`DeepseekV4Indexer` 的调用者。Wrapper 在 `attention_impl` 方法（`attention.py` L409-495）中，当 `self.indexer is not None` 时，通过 `execute_in_parallel` 三路并行执行：`wq_b_kv_insert`（L442-445）、`indexer(...)`（L454-461）、`compressor(...)`（L462）。其中 `indexer` 的调用传入参数包括 `hidden_states`、`qr`、`indexer_kv_score`、`indexer_weights`、`positions`、`self.indexer_rotary_emb`（L455-460）。`indexer_kv_score` 和 `indexer_weights` 由 `attn_gemm_parallel_execute` 预先计算（L382-390）。
+- [[DeepseekCompressor]]：`DeepseekV4Indexer` 内部创建并持有自己的 `DeepseekCompressor` 实例（L845-854），用于将输入的 `compressed_kv_score` 压缩并写入索引器的 `k_cache`。该压缩器的 `k_cache_prefix` 指向 `self.k_cache.prefix`，与主注意力的压缩器共享类似的压缩流程，但 head_dim=128（不同于主注意力的 512）。
+- [[DeepseekV4FlashMLASparseImpl]]：索引器输出的 `topk_indices_buffer` 被 `DeepseekV4FlashMLASparseImpl` 在 `_forward_decode` 和 `_forward_prefill` 中读取，用于确定每个 query 需要关注的压缩区域位置。

@@ -338,3 +338,140 @@ compress_norm_rope_store_fn(
 - **融合执行**：减少内核启动和中间数据传输。
 - **可扩展性**：支持不同压缩比、头维度，以及多种后端（CUDA cutedsl / Triton，ROCm Triton）。
 - **与 vLLM 深度集成**：复用 vLLM 的 KV 缓存管理、注意力元数据传递和编译优化框架。
+
+---
+
+## 8. 源码行号标注
+
+> 以下行号基于 `vllm/models/deepseek_v4/compressor.py`。
+
+### 8.1 关键方法行号汇总
+
+| 类 / 方法 | 文件行号 | 说明 |
+|-----------|---------|------|
+| `CompressorBackend` | L37-74 | 注意力后端，管理压缩状态元数据和内存布局 |
+| `CompressorMetadata` | L78-83 | 元数据 data class |
+| `CompressorMetadataBuilder.__init__` | L89-99 | 构造函数，获取 block_size |
+| `CompressorMetadataBuilder.build` | L101-118 | 构建元数据，计算 token_to_req_indices |
+| `CompressorStateCache.__init__` | L121-155 | 初始化状态缓存，注册到 static_forward_context |
+| `CompressorStateCache.get_kv_cache_spec` | L157-165 | 返回缓存规格（alignment=576） |
+| `DeepseekCompressor.__init__` | L184-268 | 初始化压缩器组件 |
+| `DeepseekCompressor.forward` | L270-380 | 前向传播主流程 |
+
+### 8.2 `forward` 方法 8 个步骤的行号标注
+
+```python
+# L270-380: DeepseekCompressor.forward
+
+# Step 1 (L280-282): 拆分 kv 和 score
+kv, score = kv_score.split([self.coff * self.head_dim, ...], dim=-1)
+
+# Step 2 (L285-291): 获取压缩注意力元数据
+attn_metadata = get_forward_context().attn_metadata
+if not isinstance(attn_metadata, dict):
+    return
+state_metadata = cast(CompressorMetadata, attn_metadata[self.state_cache.prefix])
+
+# Step 3 (L292-296): 提取元数据字段
+token_to_req_indices = state_metadata.token_to_req_indices
+slot_mapping = state_metadata.slot_mapping
+num_actual = slot_mapping.shape[0]
+block_table = state_metadata.block_table
+block_size = state_metadata.block_size
+
+# Step 4 (L298-301): 获取状态缓存张量
+state_cache = self.state_cache.kv_cache  # [num_blocks, block_size, 2 * state_width]
+state_width = state_cache.shape[-1] // 2
+
+# Step 5 (L314-325): 存储原始 KV 和分数（save_partial_states）
+save_partial_states(kv=kv, score=score, ape=self.ape, positions=positions,
+                    state_cache=state_cache, slot_mapping=slot_mapping,
+                    block_size=block_size, state_width=state_width,
+                    compress_ratio=self.compress_ratio, ...)
+
+# Step 6 (L334-336): 获取 KV 缓存和元数据
+k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+# Step 7 (L338-355): 选择压缩内核函数
+if current_platform.is_cuda():
+    if self.head_dim == 512:
+        compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+    else:
+        compress_norm_rope_store_fn = compress_norm_rope_store_triton
+else:
+    compress_norm_rope_store_fn = compress_norm_rope_store_triton
+
+# Step 8 (L357-380): 调用融合压缩内核
+compress_norm_rope_store_fn(state_cache=state_cache, ...,
+                            rms_norm_weight=self.norm.weight,
+                            rms_norm_eps=self.rms_norm_eps,
+                            quant_block=self._quant_block,
+                            token_stride=self._token_stride,
+                            scale_dim=self._scale_dim, ...)
+```
+
+---
+
+## 9. 两级缓存（state_cache vs kv_cache）Shape/Dtype 表
+
+| 属性 | 缓存名称 | Shape | Dtype | 存储内容 |
+|------|---------|-------|-------|---------|
+| **状态缓存** | `state_cache` (即 `self.state_cache.kv_cache`) | `[num_blocks, block_size, 2 * state_width]` | `float32` | 前半: 原始 KV 状态 (未压缩)；后半: 原始 Score 状态 (未压缩) |
+| **KV 缓存** | `kv_cache` (即 `self._static_forward_context[self.k_cache_prefix].kv_cache`) | 由 `CompressorStateCache.get_kv_cache_spec` 决定 (alignment=576) | `uint8` (量化后) | 压缩、归一化、RoPE、量化后的 KV，供注意力计算使用 |
+
+其中：
+- `state_width = state_cache.shape[-1] // 2`，即状态缓存的一半宽度。
+- `state_cache` 的 `block_size` 在 `CompressorStateCache` 中确定：C4 为 4，C128 为 8。
+- `kv_cache` 的布局由 FlashMLA 的 `fp8_ds_mla` 格式决定，每 token 584 字节（448 NoPE + 128 RoPE + 8 字节缩放因子）。
+- `state_cache` 存储浮点格式（`float32`）以避免量化误差在压缩聚合时累积；`kv_cache` 使用量化格式（FP8/MXFP4）以节省显存。
+
+---
+
+## 10. 设计决策思考
+
+### 10.1 为什么使用 float32 存储状态缓存？
+
+`CompressorStateCache` 中强制要求 `self.dtype == torch.float32`（L139）。原因如下：
+
+1. **压缩聚合的数值精度要求**：`state_cache` 存储的是**压缩前的原始 KV/Score 状态**。每个压缩组（C4 包含 4 个 token，C128 包含 128 个 token）需要在 `compress_norm_rope_store` 融合内核中进行跨 token 的加权聚合。如果使用 bfloat16 或 float16，聚合过程中的累加误差会显著放大。float32 提供足够的精度保证压缩后的状态质量。
+2. **累积过程中误差不可接受**：压缩操作本质是一个组内约简（reduction），其数值精度直接决定了后续注意力计算的质量。低精度累加可能导致信息丢失，尤其是在 C128（128 个 token 压缩为 1 个）这种高压缩比场景下。
+3. **存储不是瓶颈**：`state_cache` 的存储量远小于 `kv_cache`（因为 state_cache 只存在于压缩阶段，不需要长期保留），使用 float32 带来的显存开销是可以接受的。
+4. **与内核实现的匹配**：融合内核 `compress_norm_rope_store_cutedsl` 和 `compress_norm_rope_store_triton` 的输入预期为 float32，这与其内部使用 float32 算术单元的设计一致。
+
+### 10.2 量化锚点的物理含义
+
+```python
+# L249-268 (compressor.py)
+if self.head_dim == 512:
+    self._quant_block = 64                    # (1)
+    self._token_stride = self.nope_head_dim + self.rope_head_dim * 2  # (2)
+    self._scale_dim = self.nope_head_dim // 64 + 1  # (3)
+elif self.head_dim == 128:
+    if use_fp4_cache:
+        self._quant_block = MXFP4_BLOCK_SIZE  # 32
+        self._token_stride = self.head_dim // 2
+        self._scale_dim = self.head_dim // MXFP4_BLOCK_SIZE
+    else:
+        self._quant_block = 128
+        self._token_stride = self.head_dim
+        self._scale_dim = 4
+```
+
+**三个量化锚点的物理含义：**
+
+1. **`_quant_block`（量化块大小）**：FP8/MXFP4 量化时每多少个元素共享一个 scale 因子。`head_dim=512` 时为 64（即每 64 个元素一个 scale）；`head_dim=128` 时为 128（FP8）或 32（MXFP4）。这个值直接决定了 scale 因子的数量和量化粒度：_quant_block 越小，量化粒度越细，精度越高。
+
+2. **`_token_stride`（token 步长）**：在 FP8 量化后的缓存中，每个 token 的 KV 数据占据的连续元素数量。对于 `head_dim=512`：`_token_stride = nope_head_dim + rope_head_dim * 2 = 448 + 128 = 576`。注意 RoPE 部分占 2 倍的 rope_head_dim（因为 RoPE 部分存储为 bf16，而非 fp8）。对于 `head_dim=128`：FP8 时 stride=128，MXFP4 时 stride=64（因为是 4-bit 量化，每个元素占半字节）。这个值决定了内核在遍历 token 时的内存访问步长。
+
+3. **`_scale_dim`（scale 维度）**：每个 token 的 scale 因子总个数。对于 `head_dim=512`：`nope_head_dim // 64 + 1 = 7 + 1 = 8`（7 个实际 scale + 1 个填充字节）。对于 `head_dim=128`：FP8 时为 4（128/128*4=4 字节），MXFP4 时为 4（128/32=4）。这个值决定了在缓存中为 scale 预留的空间大小。
+
+**这些锚点的作用**：它们定义了融合压缩内核在将压缩后的状态写入 `kv_cache` 时的量化参数和内存布局。内核需要知道每个 token 的数据如何排列、scale 因子放在哪里、每个量化块有多大，才能正确执行 FP8/MXFP4 量化并写入缓存。
+
+---
+
+## 11. 交叉引用
+
+- [[DeepseekV4MultiHeadLatentAttentionWrapper]]：`DeepseekCompressor` 的调用者。Wrapper 在 `attention_impl` 方法（`attention.py` L409-495）中，当 `compress_ratio > 1` 时调用 `compressor(kv_score, positions, self.rotary_emb)`（L462/L483）。该调用通过 `maybe_execute_in_parallel` 与 `wq_b_kv_insert` 并行执行，隐藏访存延迟。Wrapper 的 `attn_gemm_parallel_execute` 方法（L349-407）还负责计算 `kv_score`（即 `compressor.fused_wkv_wgate` 的输入）。
+- [[DeepseekV4FlashMLASparseImpl]]：`DeepseekCompressor` 的输出消费者。压缩后的 KV 被写入 `kv_cache`，然后在 `_forward_decode` 和 `_forward_prefill` 中通过 `flash_mla_with_kvcache` 和 `flash_mla_sparse_fwd` 读取使用。
+- [[DeepseekV4Attention]]：管理 `DeepseekCompressor` 的创建（`attention.py` L268-278），将 `k_cache_prefix` 指向 `self.mla_attn.prefix`。

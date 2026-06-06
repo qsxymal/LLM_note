@@ -70,6 +70,11 @@ self.rope_head_dim = qk_rope_head_dim
 ```
 
 - `num_kv_heads = 1` 表明这是 **MQA (Multi-Query Attention)** 模式，可显著减少 KV 缓存大小。
+- **设计思考**：为什么 DeepSeek-V4 固定使用 MQA 而非 GQA/MHA？
+  1. **MLA 的低秩结构已隐含了 KV 压缩**：`fused_wqa_wkv` 将输入映射到低秩空间（`kv_lora_rank=head_dim`），KV 本身已经是压缩表示，无需多头 KV 来进一步减少缓存。
+  2. **FP8 缓存 + 滑动窗口 + 压缩层**：KV 缓存已通过 UE8M0 FP8 量化（每 128 元素共享一个 scale）和滑动窗口（仅保留最近 N 个 token）大幅缩减，多 KV 头的边际收益很低。
+  3. **与稀疏 Indexer 的兼容性**：C4A 层使用 indexer 进行 top-k 稀疏选择，单头 KV 使得 indexer 只需管理一个（而非多个）KV 缓存，简化了稀疏索引的设计和显存访问模式。
+  4. **对齐 FlashMLA 后端**：当前唯一后端 `FlashMLASparseBackend` 设计为 MQA 模式，固定 `num_kv_heads=1` 避免了不必要的 padding 或 kernel 适配。
 
 ### 2.3 填充头数 (padded_heads)
 
@@ -147,10 +152,15 @@ def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
   - `num_kv_heads=1`：MQA 模式。
   - `dtype=torch.uint8`：缓存使用 `uint8` 存储（内部可能解释为 FP8）。
   - `compress_ratio`：压缩比，用于确定时间压缩的 stride。
-  - `alignment=576`：FlashMLA 要求每个 block 按 576 字节对齐（576 = 64 heads × 9 bytes? 待查，但这是硬性要求）。
+  - `alignment=576`：FlashMLA 核心里硬性要求 576 字节对齐（`attention.py:716` 注释 `# NOTE: FlashMLA requires 576B alignment`）。这是 FlashMLA 内部页表管理的对齐粒度，与 `head_bytes` 无关——实际 `head_bytes` 约为 584（448 NoPE + 128 RoPE(b16) + 7 scale + 1 pad），两者数值不同。
   - `model_version="deepseek_v4"`：指定版本，可能影响布局。
 
 该规格会被 vLLM 的缓存分配器使用，为每个压缩层创建单独的 KV 缓存张量。
+
+**SWA 层与压缩层缓存策略的差异**：
+- **SWA 层**（`compress_ratio <= 1`，如 C1A）：不使用 `get_kv_cache_spec` 返回的缓存，而是由 `DeepseekV4SWACache` 在 wrapper 中自行管理环形缓冲区。该缓存仅保留最近 `window_size` 个 token 的 KV 数据，CPU/GPU 间以 `uint8` 格式传输，无需 vLLM 缓存管理器的参与。
+- **压缩层**（`compress_ratio > 1`，如 C2A、C4A）：通过 `MLAAttentionSpec` 向 vLLM 缓存管理器注册，由引擎统一分配和管理。缓存中包含按 `compress_ratio` 间隔采样的历史 KV，生命周期跨越多个 prefill/decode 步骤，需要 vLLM 的 block 管理和 page mapping。
+- 这种分离设计的合理性在于：SWA 缓存是**严格的 FIFO 环形缓冲区**（覆盖旧 token），而压缩层缓存是**分页的随机访问缓存**（需要按 block 索引查询历史），两种缓存的生命周期和访问模式不同，分开管理减少了实现的耦合度，避免了在同一个缓存系统中混合两种策略带来的复杂性。
 
 ---
 
@@ -161,7 +171,7 @@ def forward(self, q, kv, positions, output):
     self.impl_cls.forward_mqa(self, q, kv, positions, output)
 ```
 
-- 直接将调用委托给实现类的 `forward_mqa` 方法。该方法通常是一个**自定义算子**，它会：
+- 源文件 `attention.py:727`：直接将调用委托给实现类的 `forward_mqa` 静态方法，该方法由 [[DeepseekV4FlashMLASparseImpl]] 提供具体实现。该方法通常是一个**自定义算子**，它会：
   - 从 `self.swa_cache_layer` 或压缩层缓存中读取已有的 KV。
   - 使用 `self.attn_sink` 注入注意力偏置。
   - 结合 `self.indexer` 提供的位置索引（若存在）实现稀疏注意力。
@@ -215,7 +225,7 @@ def forward(self, q, kv, positions, output):
 
 - **仅支持 CUDA**：该类中大量使用了 CUDA 特有的 `torch.cuda.Event` 和 `aux_stream`，因此在 ROCm/XPU 上不可用（已在上层被 `_forward_native` 替代）。
 - **KV cache dtype 必须是 FP8**：若配置为其他格式，会直接断言失败。
-- **后端必须是 FlashMLASparseBackend**：目前没有其他实现。
+- **后端必须是 [[DeepseekV4FlashMLASparseImpl]]**（通过 `FlashMLASparseBackend` 关联）：目前没有其他实现。
 - **压缩层必须有 `compressor`**：`compress_ratio > 1` 时，wrapper 必须创建 `DeepseekCompressor`，并确保其 `kv_cache` 被正确分配。
 
 `DeepseekV4MLAAttention` 很好地扮演了 **注意力计算的后端适配层** 角色，将具体内核细节隐藏在实现类中，同时提供必要的元数据（缓存规格、对齐要求）给 vLLM 引擎。

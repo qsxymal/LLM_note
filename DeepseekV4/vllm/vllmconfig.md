@@ -1,27 +1,100 @@
-`vllm_config` 作为 vLLM 的顶层配置对象，其核心职责是 **整合并协调** 整个引擎运行所需的所有配置参数。它更像一个容器，将众多细分领域的配置对象聚合在一起，便于在系统的不同组件间进行传递和访问。每个子配置都对应一个特定的功能领域，如模型参数、并行策略、内存管理等。
+# VllmConfig —— 配置聚合与 DeepSeek V4 特有字段
 
-### 📦 VllmConfig 的核心子配置
+## 概述
 
-你可以将 `vllm_config` 理解为一个“主控台”，其下面包含一系列负责具体功能的子配置项。下面是该配置体系中几个关键的组成部分：
+`VllmConfig` 是 vLLM 的统一配置对象，聚合了模型初始化所需的全部配置项。在 DeepSeek V4 的场景中，以下字段具有特殊作用。
 
-| 配置类 (Config Class)  | 核心用途 (Purpose)                                       | 关键参数示例 (Key Parameters)                                                     |
-| :------------------ | :--------------------------------------------------- | :-------------------------------------------------------------------------- |
-| **VllmConfig**      | 顶层容器，聚合所有配置，是整个系统的配置入口。                              | `model_config`, `parallel_config`, `scheduler_config` 等。                    |
-| **ModelConfig**     | 定义与模型本身相关的信息，是 `hf_config` (即Hugging Face模型配置) 的所在地。 | `model` (模型路径/名称)、`dtype` (计算精度)、`trust_remote_code` 等。                     |
-| **ParallelConfig**  | 配置模型的分布式执行策略，如张量并行、流水线并行等。                           | `tensor_parallel_size`、`pipeline_parallel_size`、`enable_expert_parallel` 等。 |
-| **SchedulerConfig** | 负责调度策略，控制每次推理迭代中处理的批次大小，直接影响吞吐量。                     | `max_num_batched_tokens` (单次迭代最大处理token数)、`max_num_seqs` (单次迭代最大序列数)。       |
-| **CacheConfig**     | 管理KV缓存，这是vLLM高效推理的核心，负责显存利用率与缓存策略。                   | `block_size` (缓存块大小)、`gpu_memory_utilization` (GPU显存使用率)。                   |
-| **LoadConfig**      | 控制模型加载的特定行为，如加载格式。                                   | `load_format` (指定加载格式，如`safetensors`)。                                      |
-| **KernelConfig**    | 配置底层内核的选择与预热行为，以优化计算性能。                              | `ir_op_priority` (内核操作优先级配置)。                                               |
+## 重要字段
 
-除了上述核心配置类，vLLM的配置体系还包含 `CompilationConfig`（`torch.compile` 与 CUDA graph 相关）、`LoRAConfig`（LoRA适配器配置）、`SpeculativeConfig`（推测解码配置）等，以满足更细分的功能需求。
+| 字段 | 类型 | DeepSeek V4 中的关键影响 |
+|------|------|------------------------|
+| `model_config` | `ModelConfig` | 持有 `hf_config`（Hugging Face 原始配置），是 V4 架构检测的源头。 |
+| `quant_config` | `QuantizationConfig` | 在 V4 中具体化为 `DeepseekV4FP8Config`，控制 FP8/FP4 量化分发。 |
+| `parallel_config` | `ParallelConfig` | TP、PP 配置，与 EP/多流并行（`VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD`）联动。 |
+| `scheduler_config` | `SchedulerConfig` | `max_num_batched_tokens` 控制 MegaMoE `symm_buffer` 分配大小。 |
+| `cache_config` | `CacheConfig` | KV 缓存 dtype 强制为 `fp8_ds_mla`。 |
+| `speculative_config` | `SpeculativeConfig` | MTP 的 `draft_model_config.hf_config` 来源。 |
+| `compilation_config` | `CompilationConfig` | `static_forward_context` 用于 MegaMoE 的 `no_compile_layers` 注册。 |
 
-### 🔗 配置的来源与加载
+## DeepSeek V4 特有的 `hf_config` 字段
 
-这个 `vllm_config` 对象通常不是手动构建的，而是由 `EngineArgs` 或 `AsyncEngineArgs` 等参数类创建。这些参数类将所有命令行参数和API参数打包，然后通过 `create_engine_config()` 方法统一生成最终的 `VllmConfig` 实例。
+DeepSeek V4 checkpoint 的 `config.json` 包含以下对推理至关重要的字段：
 
-此外，vLLM的配置系统支持多层优先级，配置值会按照 **API直接构造 > 命令行参数 > 环境变量 > 默认值** 的顺序进行解析和合并。开发者还可以通过 `@config` 装饰器实现Pydantic校验，并能通过 `VLLM_` 开头的环境变量（如 `VLLM_ATTENTION_BACKEND`）便捷地调整运行时行为。
+### 架构基础
 
-在你的代码示例中，`vllm_config` 正是通过其 `model_config.hf_config` 这样的路径，轻松获取到DeepSeek V4模型在Hugging Face上的原始配置信息的。
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `model_type` | `"deepseek_v4"` | 架构自动检测，触发 `DeepseekV4FP8Config` 和模型注册 |
+| `hidden_size` | 4096 | 隐藏层维度 |
+| `num_attention_heads` | 64 | 注意力头数 |
+| `num_hidden_layers` | 60 | 解码器层数 |
 
-希望这份解析能帮你更好地理解和使用 vLLM。如果想深入探讨某个具体的配置，随时可以再来找我。
+### HC（Hyper-Composed）多头流
+
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `hc_mult` | 2 | 多头流数，控制 `DeepseekV4DecoderLayer` 中流并行数 |
+| `hc_sinkhorn_iters` | 1 | Sinkhorn 归一化迭代次数，控制混合系数生成精度 |
+| `hc_eps` | 1e-6 | HC 操作的 epsilon，防止除零 |
+| `hc_post_alpha` | 2.0 | **硬编码**（非 config 字段），HC 后处理的缩放因子 |
+
+### MLA（Multi-head Latent Attention）
+
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `q_lora_rank` | 1536 | Q 低秩投影维度 |
+| `kv_lora_rank` | 512 | KV 低秩投影维度（= `qk_nope_head_dim + qk_rope_head_dim`） |
+| `qk_nope_head_dim` | 128 | QK 无位置编码的 head 维度 |
+| `qk_rope_head_dim` | 64 | QK RoPE 部分的 head 维度 |
+| `v_head_dim` | 128 | Value head 维度 |
+| `attn_sink_token_num` | ？ | 注意力 sink token 数量 |
+
+### MoE（Mixture of Experts）
+
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `n_routed_experts` | 256 | 路由专家总数 |
+| `num_experts_per_tok` | 8 | 每 token 激活的专家数（top-k） |
+| `moe_intermediate_size` | 2048 | MoE FFN 的中间维度 |
+| `shared_expert_intermediate_size` | ？ | 共享专家的中间维度 |
+| `expert_dtype` | `"fp4"` 或 `"fp8"` | 专家权重精度，控制量化方法路由 |
+| `moe_quant_algo` | `"NVFP4"` 或空 | MoE 量化算法，空表示默认 MXFP4 |
+| `index_topk` | ？ | Indexer 使用的 topk 数量 |
+
+### 压缩与稀疏注意力
+
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `compress_ratio` | 4 或 128 | KV 缓存压缩比，控制稀疏注意力模式（C4A vs C128） |
+| `sliding_window_size` | ？ | 滑动窗口大小 |
+| `attn_cache_compress_ratio` | ？ | 注意力缓存的压缩比（与 compress_ratio 联动） |
+
+### 推测解码
+
+| 字段 | 典型值 | 说明 |
+|------|-------|------|
+| `num_nextn_predict_layers` | ？ | MTP 额外预测层数，即 `num_mtp_layers` |
+
+## DeepSeek V4 配置交互矩阵
+
+| hc_mult | compress_ratio | expert_dtype | use_mega_moe | 影响 |
+|---------|---------------|-------------|-------------|------|
+| 2 | 4 | fp4 | True | 完整 V4 架构：C4A 稀疏注意力 + FP4 MegaMoE（SM100） |
+| 2 | 4 | fp8 | False | C4A + FP8 FusedMoE（通用 GPU） |
+| 2 | 128 | fp4 | True | C128 稀疏注意力 + FP4 MegaMoE |
+| 2 | 1 | fp4 | False | SWA-only（无压缩）+ FP4 FusedMoE |
+
+## 关键设计：lazy `expert_dtype` 解析
+
+`DeepseekV4FP8Config` 在 `VllmConfig` 构造阶段创建，此时 `set_current_vllm_config` 尚未激活。`expert_dtype` 在首次实际访问时才从 `hf_config` 读取（`quant_config.py:L56-L76`），确保 Flash-Base checkpoint 能被正确路由。
+
+详见 [[DeepseekV4FP8Config#2-关键设计：Lazy-expert_dtype-解析]]。
+
+## Cross-References
+
+- [[DeepseekV4FP8Config]]：`quant_config` 的具体实现和执行分发
+- [[QuantAndParallelStrategy]]：`quant_config` 与 `parallel_config` 联动
+- [[DeepseekV4MoE]]：`moe_intermediate_size` 和 `n_routed_experts` 如何影响 MoE 层初始化
+- [[DeepseekV4DecoderLayer]]：`hc_mult` 控制流并行度
+- [[DeepseekV4Model]]：`num_hidden_layers` 和 PP 切分
+- [[MTP]]：`num_nextn_predict_layers` 控制 MTP 规模

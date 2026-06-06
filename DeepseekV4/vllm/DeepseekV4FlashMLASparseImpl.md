@@ -466,3 +466,163 @@ flash_mla_sparse_fwd(
 5. **平台特定优化**：通过 `get_padded_num_q_heads` 和 `get_kv_cache_shape` 适配 FlashMLA 的具体要求（64/128 头、584B 缓存行）。
 
 总之，`DeepseekV4FlashMLASparseImpl` 是 DeepSeek-V4 注意力性能的关键，它紧密耦合了 FlashMLA 内核，并利用 vLLM 的元数据基础设施，实现了大规模稀疏注意力的高效推理。
+
+---
+
+## 8. 源码行号标注
+
+> 以下行号基于 `vllm/models/deepseek_v4/nvidia/flashmla.py`。
+
+### 8.1 `forward_mqa` 中区分 decode/prefill (L183-208)
+
+```python
+# L184-186: 从 swa_metadata 中提取统计量
+num_decodes = swa_metadata.num_decodes
+num_prefills = swa_metadata.num_prefills
+num_decode_tokens = swa_metadata.num_decode_tokens
+
+# L188-198: prefill 分支 —— 处理完整序列
+if num_prefills > 0:
+    cls._forward_prefill(
+        layer=layer,
+        q=q[num_decode_tokens:],              # 从 decode token 之后开始
+        positions=positions[num_decode_tokens:],
+        compressed_k_cache=self_kv_cache,
+        swa_k_cache=swa_kv_cache,
+        output=output[num_decode_tokens:],
+        attn_metadata=flashmla_metadata,
+        swa_metadata=swa_metadata,
+    )
+# L199-208: decode 分支 —— 逐个 token 生成
+if num_decodes > 0:
+    cls._forward_decode(
+        layer=layer,
+        q=q[:num_decode_tokens],              # 取前 num_decode_tokens
+        kv_cache=self_kv_cache,
+        swa_metadata=swa_metadata,
+        attn_metadata=flashmla_metadata,
+        swa_only=swa_only,
+        output=output[:num_decode_tokens],
+    )
+```
+
+- `q` 和 `output` 的第一维是 `[num_decode_tokens + num_prefill_tokens]`，直接按索引切片。
+- prefill 和 decode 是两个独立路径，分别调用不同的 FlashMLA 内核。
+
+### 8.2 `_forward_decode` 中 `flash_mla_with_kvcache` 调用 (L286-302)
+
+```python
+out, _ = flash_mla_with_kvcache(
+    q=q,                                    # [num_decode_tokens, 1, padded_heads, head_dim]
+    k_cache=swa_cache,                      # 滑动窗口 KV 缓存 [num_blocks, block_size, 1, head_bytes]
+    block_table=None,                        # 不使用 block_table（索引驱动）
+    head_dim_v=512,                          # V 的完整维度（未压缩）
+    tile_scheduler_metadata=tile_metadata,   # 预计算的 warp 调度元数据
+    cache_seqlens=None,                      # 不使用 seqlens（索引驱动）
+    is_fp8_kvcache=True,                     # KV 缓存为 FP8 格式
+    indices=swa_indices,                     # 滑动窗口索引 [num_tokens, window_size]
+    topk_length=swa_lens,                    # 每个 token 实际 SWA 长度
+    softmax_scale=layer.scale,               # attention scale 因子
+    attn_sink=layer.attn_sink,               # attention sink 偏置
+    extra_k_cache=kv_cache if not swa_only else None,  # 压缩区域 KV 缓存（可选）
+    extra_indices_in_kvcache=topk_indices,    # 压缩区域 topk 索引
+    extra_topk_length=topk_lens,              # 每个 token 的 topk 数量
+    out=output.unsqueeze(1),                  # 输出 [num_tokens, 1, padded_heads, head_dim]
+)
+```
+
+参数含义详解：
+- **`k_cache`**：主 KV 缓存，存储滑动窗口区域。形状 `[num_blocks, block_size, 1, head_bytes]`，其中 `head_bytes` 是实际存储字节数（含量化 scale）。
+- **`head_dim_v=512`**：V 的维度。DeepSeek-V4 中 V 没有压缩，保持完整的 512 维（448 NoPE + 64 RoPE）。
+- **`tile_scheduler_metadata`**：FlashMLA 内核需要的 tile 调度元数据，由 `DeepseekSparseSWAMetadataBuilder` 在元数据构建时根据序列长度、稀疏模式预计算。不同压缩比（1/4/128）使用不同的调度元数据（`tile_sched_swaonly` / `tile_sched_c4a` / `tile_sched_c128a`）。
+- **`indices` / `topk_length`**：控制滑动窗口内的索引。`indices` 形状 `[num_tokens, window_size]`，表示每个 token 需要关注的 SWA 位置；`topk_length` 是每个 token 实际有效的索引数（变长支持）。
+- **`extra_k_cache` / `extra_indices_in_kvcache` / `extra_topk_length`**：可选参数，当 `compress_ratio > 1` 时传入压缩区域的 KV 缓存和 top-k 索引，实现 SWA + 压缩区域的联合注意力。
+- **`attn_sink`**：作为偏置加到 logits 上，用于 attention sink 技术。
+- **`is_fp8_kvcache=True`**：KV 缓存以 FP8 格式存储，内核内部使用 FP8 乘法累加。
+
+### 8.3 `_forward_prefill` 中 chunk 循环处理 (L365-424)
+
+```python
+# L365: 按 chunk 循环
+for chunk_idx in range(num_chunks):
+    chunk_start = chunk_idx * chunk_size_const
+    chunk_end = min(chunk_start + chunk_size_const, num_prefills)
+    chunk_size = chunk_end - chunk_start
+
+    # L369-381: 收集压缩区域的 KV（若存在压缩层）
+    if not swa_only:
+        dequantize_and_gather_k_cache(
+            kv[:chunk_size],
+            compressed_k_cache,
+            seq_lens=seq_lens[chunk_start:chunk_end] // layer.compress_ratio,
+            gather_lens=None,
+            block_table=block_table[chunk_start:chunk_end],
+            block_size=attn_metadata.block_size // layer.compress_ratio,
+            offset=0,                           # 从 kv 缓冲区头开始写入
+        )
+
+    # L384-393: 收集滑动窗口区域的 KV
+    dequantize_and_gather_k_cache(
+        kv[:chunk_size],
+        swa_k_cache,
+        seq_lens=seq_lens[chunk_start:chunk_end],
+        gather_lens=gather_lens[chunk_start:chunk_end],
+        block_table=swa_block_table[chunk_start:chunk_end],
+        block_size=swa_metadata.block_size,
+        offset=N,                               # 在压缩区域之后写入
+    )
+
+    # L403-415: 合并 topk 索引和 SWA 索引
+    combined_indices, combined_lens = combine_topk_swa_indices(
+        topk_indices[query_start:query_end],
+        query_start_loc[num_decodes + chunk_start : num_decodes + chunk_end + 1],
+        seq_lens[chunk_start:chunk_end],
+        gather_lens[chunk_start:chunk_end],
+        layer.window_size, layer.compress_ratio, top_k, M, N,
+    )
+
+    # L416-424: 执行稀疏注意力
+    flash_mla_sparse_fwd(
+        q=q[query_start:query_end],
+        kv=kv.view(-1, 1, q.shape[-1]),         # reshape 为 [total_kv, 1, head_dim]
+        indices=combined_indices.unsqueeze(1),  # [total_tokens, 1, total_indices]
+        sm_scale=layer.scale,
+        attn_sink=layer.attn_sink,
+        topk_length=combined_lens,
+        out=output[query_start:query_end],
+    )
+```
+
+- 每次处理最多 `PREFILL_CHUNK_SIZE=4` 个序列，避免临时缓冲区过大。
+- 使用 `dequantize_and_gather_k_cache` 将 FP8 缓存的 KV 反量化为 BF16 并收集到连续缓冲区 `kv`。
+- `flash_mla_sparse_fwd` 是 prefill 专用内核，与 decode 的 `flash_mla_with_kvcache` 不同：后者直接从缓存读取，前者从已 gather 的连续缓冲区读取。
+
+---
+
+## 9. 设计决策思考
+
+### 9.1 为什么 `padded_heads` 是 64 或 128？
+
+```python
+# L119-127 (flashmla.py)
+@classmethod
+def get_padded_num_q_heads(cls, num_heads: int) -> int:
+    if num_heads > 128:
+        raise ValueError(...)
+    return 64 if num_heads <= 64 else 128
+```
+
+根本原因：**FlashMLA 的 FP8 decode 内核（`flash_mla_with_kvcache`）的 warp 级并行调度要求 Q head 数必须是 64 或 128。**
+
+具体来说：
+1. **硬件约束**：FlashMLA 内核在解码阶段使用固定的 warp 调度策略，每个 warp 处理固定数量的 head。当 `h_q=64` 时，warp 调度为 `(4 warps × 16 heads)`；当 `h_q=128` 时，调度为 `(8 warps × 16 heads)`。其他 head 数无法映射到内核的固定调度模板。
+2. **填充策略**：若模型实际 head 数 `<= 64`（例如 DeepSeek-V4 的标准配置 `n_local_heads=16`），填充到 64；若在 `(64, 128]` 之间，填充到 128。填充的 head 位置值为 0，不影响 softmax 输出。
+3. **与 wrapper 的协作**：`DeepseekV4MultiHeadLatentAttentionWrapper` 在分配 Q 和输出缓冲区时使用 `self.padded_heads`（L255: `self.padded_heads = self.mla_attn.padded_heads`），形状为 `[num_tokens, padded_heads, head_dim]`。计算完成后通过 `o = o_padded[:, :self.n_local_heads, :]` 切片取出有效 head（L302）。
+4. **性能 vs 显存权衡**：填充少量 head（64-16=48 个无效 head）带来的额外计算量很小，但使得内核可以使用最优的 warp 调度，大幅提升吞吐。这是一种"以少量冗余计算换取更大并行度"的经典优化策略。
+
+---
+
+## 10. 交叉引用
+
+- [[DeepseekV4MultiHeadLatentAttentionWrapper]]：`DeepseekV4FlashMLASparseImpl` 的上层调用者。Wrapper 负责 MLA 的预处理（QR/KV 投影、RoPE、KV 缓存插入）和输出投影（逆 RoPE + WoA + WoB），而 `DeepseekV4FlashMLASparseImpl` 只负责注意力核心计算（`flash_mla_with_kvcache` / `flash_mla_sparse_fwd`）。wrapper 在 `attention_impl` 方法（L409）中调用 `self.mla_attn(q, kv, positions, output=out)`，其中 `mla_attn` 是 `DeepseekV4MLAAttention` 实例（L235），其 `forward` 方法（L727）直接调用 `self.impl_cls.forward_mqa(self, q, kv, positions, output)`，即 `DeepseekV4FlashMLASparseImpl.forward_mqa`。
+- [[DeepseekV4MLAAttention]]：`DeepseekV4MLAAttention` 是连接 Wrapper 和 Impl 的中间层，负责初始化 `impl_cls`、管理 KV 缓存和 `padded_heads`。

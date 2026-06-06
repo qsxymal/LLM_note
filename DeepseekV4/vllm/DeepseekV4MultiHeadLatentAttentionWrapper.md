@@ -116,7 +116,7 @@ self.padded_heads = self.mla_attn.padded_heads
 - `padded_heads` 用于分配输出缓冲区时预留足够空间。
 
 ### 2.6 压缩器 (Compressor) 初始化
-[[DeepseekCompressor]]
+[[DeepseekCompressor]]、[[DeepseekV4Indexer]]
 
 ```python
 if self.compress_ratio > 1:
@@ -260,6 +260,7 @@ qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
 - `fused_wqa_wkv` 是最重的 GEMM（输入到两个低秩空间），放在默认流。
 - 压缩器和 indexer 的辅助 GEMM 与主 GEMM 在硬件上可以重叠（因为它们使用不同的张量），从而隐藏延迟。
 - 这正是 TRT-LLM PR #14142 中描述的 Level 1 重叠策略。
+- `aux_stream_list` 在 `DeepseekV4Model` 中创建（`nvidia/model.py:L1102-1106`），共 3 个 CUDA 流，分别对应 compressor_kv_score、indexer.weights_proj、indexer.compressor_kv_score 三个辅助 GEMM。其中 `aux_stream_list[2]` 还被 indexer 内部复用，用于其 wq_b+quant 与 compressor 的二级流水重叠（`nvidia/model.py:L783-787`）。
 
 ---
 
@@ -283,11 +284,15 @@ qr, kv = fused_q_kv_rmsnorm(qr, kv, self.q_norm.weight.data, self.kv_norm.weight
 
 - `fused_q_kv_rmsnorm` 是一个融合内核，同时计算两个 RMSNorm。
 
+- `attention.py:422` 的 `qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)` 将 `fused_wqa_wkv` 的输出在最后一维拆分为两部分：
+  - `qr`（形状 `[num_tokens, q_lora_rank]`，通常 1536）：低秩 Q 表示。后续通过 `wq_b` 线性映射回 `n_local_heads * head_dim` 的完整 Q 空间。
+  - `kv`（形状 `[num_tokens, head_dim]`，通常 512）：单头 KV 表示。物理维度为 `nope_head_dim + rope_head_dim`，所有 Q 头共享此单头 KV（MQA 模式）。
+
 ### 5.2 根据是否有 Indexer/Compressor 选择重叠策略
 
 代码中分三种情况：
 
-#### (a) 有 Indexer（C4A 层）
+#### (a) 有 Indexer（C4A 层） —— `attention.py:435`
 
 ```python
 def wq_b_kv_insert() -> torch.Tensor:
@@ -314,7 +319,7 @@ q, _ = execute_in_parallel(
 - 辅助任务 1：Compressor 的前向（压缩 KV）。
 - 三个任务并行执行，进一步重叠。
 
-#### (b) 有 Compressor 但无 Indexer
+#### (b) 有 Compressor 但无 Indexer —— `attention.py:469`
 
 ```python
 q, _ = maybe_execute_in_parallel(
@@ -326,7 +331,7 @@ q, _ = maybe_execute_in_parallel(
 
 - 两个任务并行：主任务（`wq_b + kv_insert`）和压缩器。
 
-#### (c) 只有 SWA（无 Compressor 无 Indexer）
+#### (c) 只有 SWA（无 Compressor 无 Indexer） —— `attention.py:488`
 
 ```python
 q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
@@ -335,7 +340,7 @@ q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
 - 直接执行，无重叠。
 
-### 5.3 `_fused_qnorm_rope_kv_insert` 的作用
+### 5.3 `_fused_qnorm_rope_kv_insert` 的作用（方法定义：`attention.py:497`）
 
 ```python
 def _fused_qnorm_rope_kv_insert(...):
@@ -350,6 +355,8 @@ def _fused_qnorm_rope_kv_insert(...):
   - Q 侧：`q_head_norm`（per‑head RMSNorm，无学习权重）+ GPT‑J 风格的 RoPE（对 `rope_head_dim` 部分旋转），并将 Q 填充到 `padded_heads`（不足的补零）。
   - KV 侧：对 `kv` 应用 RoPE（仅 `rope_head_dim` 部分），然后量化为 UE8M0 FP8 格式，并插入到滑动窗口缓存（`swa_kv_cache`）中，使用给定的 `slot_mapping` 定位。
 - 最终返回填充后的 Q 张量（形状 `[num_tokens, padded_heads, head_dim]`），供后续注意力使用。
+
+- **调用位置**（均位于 `attention_impl` 中）：① 有 Indexer 分支第 444 行；② 有 Compressor 分支第 478 行；③ SWA only 分支第 491 行。每次调用都紧跟在 `self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)` 之后，作用是对扩展后的 Q 做 per-head norm + RoPE + zero-padding，同时对单头 KV 做 RoPE + UE8M0 FP8 量化 + 插入 SWA 缓存。
 
 ### 5.4 调用 MLA 注意力
 
