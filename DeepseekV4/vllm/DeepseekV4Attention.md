@@ -202,7 +202,7 @@ if self.compress_ratio == 4:                                                   #
     # Only C4A uses sparse attention and hence has indexer.
     # aux_stream_list[0] runs indexer.forward() in the wrapper; [2] is
     # free here (outer GEMMs joined) for the inner overlap of
-    # wq_b+fused_indexer_q_rope_quant vs compressor.
+    # wq_b+[[FusedIndexerQ|fused_indexer_q_rope_quant]] vs compressor.
     indexer_aux_stream = (                                                     # L786-L788
         aux_stream_list[2] if aux_stream_list is not None else None
     )
@@ -351,11 +351,11 @@ def forward(
 2. 调用自定义 op `torch.ops.vllm.deepseek_v4_attention`（L296-L301），进入 `attention_impl`。
 3. `attention_impl`（L409-L495）：
    - 调用 `attn_gemm_parallel_execute` 并行执行输入 GEMM（`fused_wqa_wkv` + 可选 compressor/indexer）。
-   - 对 `qr` 和 `kv` 进行 RMSNorm（`fused_q_kv_rmsnorm`）。
+   - 对 `qr` 和 `kv` 进行 RMSNorm（[[common_ops#fused_q_kv_rmsnorm|`fused_q_kv_rmsnorm`]]）。
    - 根据是否有 Indexer/Compressor，使用 `execute_in_parallel` 或 `maybe_execute_in_parallel` 执行 `wq_b + kv_insert` 与 compressor/indexer 的重叠。
    - 调用 `self.mla_attn(q, kv, positions, output=out)` 执行 FlashMLA 注意力。
 4. 切片取前 `n_local_heads` 个头的输出（L302）：`o = o_padded[:, :self.n_local_heads, :]`。
-5. 输出投影：`fused_inv_rope_fp8_quant` -> `fp8_einsum(wo_a)` -> `wo_b`（L318-L347）。
+5. 输出投影：[[FusedInvRopeFP8Quant|`fused_inv_rope_fp8_quant`]] -> `fp8_einsum(wo_a)` -> `wo_b`（L318-L347）。
 
 ---
 

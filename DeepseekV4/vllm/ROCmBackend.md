@@ -1,14 +1,14 @@
-# ROCm Attention Backend for DeepSeek V4
+# DeepSeek V4 的 ROCm 注意力后端
 
-## Overview
+## 概述
 
-The file `vllm/models/deepseek_v4/amd/rocm.py` provides the **AMD ROCm-specific** implementation of DeepSeek V4's sparse MLA (Multi-head Latent Attention) backend. It is the ROCm counterpart of [[DeepseekV4_KVCache_Ops#NVIDIA Backend|the NVIDIA flashmla.py backend]].
+文件 `vllm/models/deepseek_v4/amd/rocm.py` 提供了 DeepSeek V4 稀疏 MLA（多头潜在注意力）的 **AMD ROCm 特定**实现。它是 [[DeepseekV4_KVCache_Ops#NVIDIA 后端|NVIDIA flashmla.py 后端]]的 ROCm 对应实现。
 
-ROCm cannot use NVIDIA's `flash_mla_with_kvcache` or `flash_mla_sparse_fwd` CUDA kernels (which depend on cuDNN/CUTLASS for Hopper GPUs). Instead, it delegates to Triton-based sparse attention kernels in the `rocm_aiter_mla_sparse` module. The defining architectural difference is that ROCm uses a **ragged (COO-like) format** for sparse indices, whereas NVIDIA uses a **dense padded format**.
+ROCm 无法使用 NVIDIA 的 `flash_mla_with_kvcache` 或 `flash_mla_sparse_fwd` CUDA 内核（这些内核依赖于 Hopper GPU 上的 cuDNN/CUTLASS）。相反，它委托给 `rocm_aiter_mla_sparse` 模块中基于 Triton 的稀疏注意力内核。两者架构上的关键区别在于：ROCm 使用**不规则（类 COO）格式**表示稀疏索引，而 NVIDIA 使用**稠密填充格式**。
 
 ---
 
-## Class Hierarchy
+## 类层次结构
 
 ```
 AttentionBackend                          (vllm.v1.attention.backend)
@@ -17,7 +17,7 @@ AttentionBackend                          (vllm.v1.attention.backend)
               └── DeepseekV4ROCMAiterMLASparseBackend   [L576-587]
 
 SparseMLAAttentionImpl                    (vllm.v1.attention.backend)
-  └── DeepseekV4SparseMLAAttentionImpl    (nvidia/flashmla.py, abstract)
+  └── DeepseekV4SparseMLAAttentionImpl    (nvidia/flashmla.py, 抽象类)
         └── DeepseekV4FlashMLASparseImpl  (nvidia/flashmla.py)
               └── DeepseekV4ROCMAiterMLASparseImpl       [L590-856]
 
@@ -34,111 +34,111 @@ DeepseekSparseSWAMetadataBuilder          (sparse_swa.py)
   └── DeepseekV4ROCMAiterSparseSWAMetadataBuilder        [L522-573]
 ```
 
-The ROCm classes override the NVIDIA versions to inject ragged-format metadata and wire in ROCm-specific attention kernels. They do not add new layers to the inheritance hierarchy but rather slot in as alternative backends selected at runtime based on `current_platform.is_rocm()`.
+ROCm 类覆盖了 NVIDIA 版本，以注入不规则格式的元数据并接入 ROCm 特定的注意力内核。它们没有在继承层次中添加新层级，而是在运行时基于 `current_platform.is_rocm()` 作为替代后端被选择。
 
 ---
 
-## Dense vs. Ragged Format
+## 稠密格式 vs. 不规则格式
 
-This is the central design distinction between the NVIDIA and ROCm backends.
+这是 NVIDIA 和 ROCm 后端之间的核心设计区别。
 
-### Dense Format (NVIDIA)
+### 稠密格式（NVIDIA）
 
-Used by `flash_mla_with_kvcache` and `flash_mla_sparse_fwd`:
+由 `flash_mla_with_kvcache` 和 `flash_mla_sparse_fwd` 使用：
 
-- Every token has a **fixed-width** 2D tensor of indices, padded with `-1` sentinels.
-- Each row has shape `(1, TOP_K)` or `(1, combined_topk)`.
-- The kernel uses `topk_length` values to know how many entries per row are valid.
-- Padding guarantees aligned memory accesses for CUDA kernel launch configurations.
+- 每个 token 都有一个**固定宽度**的二维索引张量，使用 `-1` 哨兵值填充。
+- 每行形状为 `(1, TOP_K)` 或 `(1, combined_topk)`。
+- 内核使用 `topk_length` 值来知道每行有多少个有效条目。
+- 填充保证了 CUDA 内核启动配置的内存对齐访问。
 
-### Ragged Format (ROCm)
+### 不规则格式（ROCm）
 
-Required by ROCm's `rocm_sparse_attn_decode` / `rocm_sparse_attn_prefill`:
+ROCm 的 `rocm_sparse_attn_decode` / `rocm_sparse_attn_prefill` 要求：
 
-- A **flat 1D tensor** containing only the valid (non-padded) indices concatenated across all tokens.
-- A companion **indptr** tensor of shape `(num_tokens + 1,)` delimits each token's range via CSR-style pointers: `indices[indptr[i]:indptr[i+1]]` are the valid entries for token `i`.
-- Also carries a **lengths** tensor for compatibility with the NVIDIA code path.
+- 一个**扁平的一维张量**，只包含所有 token 的有效（非填充）索引，连接在一起。
+- 一个伴随的 **indptr** 张量，形状为 `(num_tokens + 1,)`，通过类似 CSR 的指针界定每个 token 的范围：`indices[indptr[i]:indptr[i+1]]` 是 token `i` 的有效条目。
+- 还带有一个 **lengths** 张量，用于与 NVIDIA 代码路径的兼容性。
 
-The ragged format is analogous to CSR (Compressed Sparse Row) or COO encoding. It eliminates wasted memory from padding tokens. ROCm uses ragged because its Triton-based sparse kernels (originally designed for the DeepSeek V3 Aiter backend) operate on this representation and lack the padded-index kernel support that the NVIDIA CUDA kernels provide.
+不规则格式类似于 CSR（压缩稀疏行）或 COO 编码。它消除了填充 token 带来的内存浪费。ROCm 使用不规则格式，因为其基于 Triton 的稀疏内核（最初为 DeepSeek V3 Aiter 后端设计）操作在此表示上，并且缺少 NVIDIA CUDA 内核所支持的填充索引内核。
 
-### Building Ragged from Dense
+### 从稠密构建不规则
 
-The helper `build_ragged_indices_from_dense` (defined in `rocm_aiter_mla_sparse.py`, called from both metadata builders) performs the conversion:
+辅助函数 `build_ragged_indices_from_dense`（定义在 `rocm_aiter_mla_sparse.py` 中，从两个元数据构建器中调用）执行转换：
 
-1. Clamp the lengths tensor to `[0, max_width]` to guard against out-of-range entries.
-2. Compute the indptr via `cumsum(lengths)`.
-3. Allocate a flat tensor of size `indptr[-1]`.
-4. Launch `_pack_dense_prefix_to_ragged_kernel` to scatter valid entries into the flat buffer.
+1. 将 lengths 张量限制在 `[0, max_width]` 范围内，以防止越界条目。
+2. 通过 `cumsum(lengths)` 计算 indptr。
+3. 分配一个大小为 `indptr[-1]` 的扁平张量。
+4. 启动 `_pack_dense_prefix_to_ragged_kernel` 将有效条目散布到扁平缓冲区中。
 
 ---
 
-## Ragged Metadata Dataclasses
+## 不规则元数据数据类
 
 ### `DeepseekV4ROCMAiterMLASparseMetadata` [L451-456]
-Extends `FlashMLASparseMetadata` with two extra ragged fields for C128A decode:
+扩展 `FlashMLASparseMetadata`，为 C128A 解码添加两个不规则字段：
 
 ```python
-c128a_decode_topk_ragged_indices: torch.Tensor | None  # flat 1D
+c128a_decode_topk_ragged_indices: torch.Tensor | None  # 扁平一维
 c128a_decode_topk_ragged_indptr: torch.Tensor | None    # (max_tokens+1,)
 ```
 
 ### `DeepseekV4ROCMAiterSparseSWAMetadata` [L459-462]
-Extends `DeepseekSparseSWAMetadata` with ragged SWA indices for decode:
+扩展 `DeepseekSparseSWAMetadata`，为解码添加不规则 SWA 索引：
 
 ```python
-decode_swa_ragged_indices: torch.Tensor | None  # flat 1D
+decode_swa_ragged_indices: torch.Tensor | None  # 扁平一维
 decode_swa_ragged_indptr: torch.Tensor | None   # (max_tokens+1,)
 ```
 
 ---
 
-## Metadata Building Pipeline
+## 元数据构建流程
 
-### C128A (Compress Ratio = 128)
+### C128A（压缩率 = 128）
 
-The `DeepseekV4ROCMAiterMLASparseMetadataBuilder` [L465-519] follows this pipeline:
+`DeepseekV4ROCMAiterMLASparseMetadataBuilder` [L465-519] 遵循以下流程：
 
-1. **Pre-allocate buffers** at constructor time (if `compress_ratio == 128`): ragged indices buffer of shape `(max_tokens * c128a_max_compressed,)` and indptr buffer of shape `(max_tokens + 1,)`. These are persistent for [[V1AttentionBackend#CUDA Graphs|CUDA graph compatibility]].
+1. **在构造函数时预分配缓冲区**（如果 `compress_ratio == 128`）：形状为 `(max_tokens * c128a_max_compressed,)` 的不规则索引缓冲区和形状为 `(max_tokens + 1,)` 的 indptr 缓冲区。这些是持久化的，以实现 [[V1AttentionBackend#CUDA 图|CUDA 图兼容性]]。
 
-2. **`build()`**: Calls the parent `FlashMLASparseMetadataBuilder.build()` which produces the **dense** `c128a_global_decode_topk_indices` and `c128a_decode_topk_lens`.
+2. **`build()`**：调用父类的 `FlashMLASparseMetadataBuilder.build()`，生成**稠密**的 `c128a_global_decode_topk_indices` 和 `c128a_decode_topk_lens`。
 
-3. **Ragged conversion**: Calls `build_ragged_indices_from_dense(dense_decode, decode_lens)` to produce ragged indices + indptr from the dense parent output.
+3. **不规则转换**：调用 `build_ragged_indices_from_dense(dense_decode, decode_lens)` 从稠密的父类输出生成不规则索引 + indptr。
 
-4. **Copy to graph buffers**: Calls `_copy_ragged_to_graph_buffers()` to copy the ragged metadata into the pre-allocated persistent buffers.
+4. **复制到图缓冲区**：调用 `_copy_ragged_to_graph_buffers()` 将不规则元数据复制到预分配的持久缓冲区中。
 
-5. Return a `DeepseekV4ROCMAiterMLASparseMetadata` with both dense (inherited) and ragged (new) fields populated.
+5. 返回一个 `DeepseekV4ROCMAiterMLASparseMetadata`，其中稠密字段（继承）和不规则字段（新增）都已填充。
 
-### SWA (Sliding Window Attention)
+### SWA（滑动窗口注意力）
 
-The `DeepseekV4ROCMAiterSparseSWAMetadataBuilder` [L522-573] follows the same pattern:
+`DeepseekV4ROCMAiterSparseSWAMetadataBuilder` [L522-573] 遵循相同的模式：
 
-1. **Pre-allocate** buffers of size `(max_tokens * window_size,)` for ragged indices and `(max_tokens + 1,)` for indptr.
+1. **预分配**大小为 `(max_tokens * window_size,)` 的不规则索引缓冲区和 `(max_tokens + 1,)` 的 indptr 缓冲区。
 
-2. **`build()`**: Calls parent `DeepseekSparseSWAMetadataBuilder.build()` to produce dense `decode_swa_indices` and `decode_swa_lens`.
+2. **`build()`**：调用父类的 `DeepseekSparseSWAMetadataBuilder.build()` 生成稠密的 `decode_swa_indices` 和 `decode_swa_lens`。
 
-3. **Ragged conversion**: Converts dense decode SWA indices to ragged.
+3. **不规则转换**：将稠密的解码 SWA 索引转换为不规则格式。
 
-4. **Copy to graph buffers**: Copies into pre-allocated persistent storage.
+4. **复制到图缓冲区**：复制到预分配的持久存储中。
 
-5. Return `DeepseekV4ROCMAiterSparseSWAMetadata` with ragged fields populated.
+5. 返回填充了不规则字段的 `DeepseekV4ROCMAiterSparseSWAMetadata`。
 
-### C4A (Compress Ratio = 4)
+### C4A（压缩率 = 4）
 
-C4A does **not** go through the metadata builder for its ragged indices. Instead, `_forward_decode()` [L700-712] calls `compute_global_topk_ragged_indices_and_indptr` **inline** during each decode step. This is because C4A topk indices differ per layer (they are filled by the Indexer at every step), so they cannot be pre-computed in the metadata builder.
+C4A **不**通过元数据构建器处理其不规则索引。相反，`_forward_decode()` [L700-712] 在每个解码步骤中**内联**调用 `compute_global_topk_ragged_indices_and_indptr`。这是因为 C4A topk 索引每层都不同（它们由 Indexer 在每一步填充），因此无法在元数据构建器中预先计算。
 
-The function `compute_global_topk_ragged_indices_and_indptr` [L236-277] is the AMD-specific replacement for the common `compute_global_topk_indices_and_lens` (which outputs dense). It:
+函数 `compute_global_topk_ragged_indices_and_indptr` [L236-277] 是通用 `compute_global_topk_indices_and_lens`（输出稠密）的 AMD 特定替代。它：
 
-1. Counts valid entries per token via `_compute_topk_lens_kernel`.
-2. Builds indptr from lengths via `_build_indptr_from_lengths`.
-3. Packs ragged indices from local -> global (block table lookup) via `_pack_global_topk_ragged_kernel`.
+1. 通过 `_compute_topk_lens_kernel` 统计每个 token 的有效条目数。
+2. 通过 `_build_indptr_from_lengths` 从 lengths 构建 indptr。
+3. 通过 `_pack_global_topk_ragged_kernel` 将不规则索引从局部打包为全局（块表查找）。
 
 ---
 
-## CUDA Graph Compatibility Strategy
+## CUDA 图兼容性策略
 
-ROCm uses the same approach as NVIDIA for [[V1AttentionBackend#CUDA Graphs|CUDA graph compatibility]]: pre-allocate persistent buffers so kernel argument addresses are stable across graph replay.
+ROCm 使用与 NVIDIA 相同的 [[V1AttentionBackend#CUDA 图|CUDA 图兼容性]]方法：预分配持久缓冲区，使得内核参数地址在图重放时保持稳定。
 
-The function `_copy_ragged_to_graph_buffers` [L427-448] handles the ragged-specific graph copy:
+函数 `_copy_ragged_to_graph_buffers` [L427-448] 处理不规则特定的图复制：
 
 ```python
 def _copy_ragged_to_graph_buffers(
@@ -148,23 +148,23 @@ def _copy_ragged_to_graph_buffers(
 ) -> tuple[Tensor, Tensor]:
 ```
 
-- Copies indptr as a slice `[:num_rows + 1]` with `non_blocking=True`.
-- Copies indices as a slice `[:nnz]` capped at `num_rows * max_entries_per_row`, also with `non_blocking=True`.
-- Returns sliced views backed by the stable buffer storage so kernel argument addresses remain the same across graph capture and replay.
-- The `non_blocking=True` flag enables H2D copy overlap with computation.
+- 以切片 `[:num_rows + 1]` 的形式复制 indptr，使用 `non_blocking=True`。
+- 以切片 `[:nnz]` 的形式复制索引，上限为 `num_rows * max_entries_per_row`，也使用 `non_blocking=True`。
+- 返回由稳定缓冲区存储支持的切片视图，使得内核参数地址在图捕获和重放之间保持不变。
+- `non_blocking=True` 标志允许 H2D 复制与计算重叠。
 
 ---
 
-## Forward Pass Flow
+## 前向传播流程
 
-### `forward_mqa()` [L600-675] -- Entry Point
+### `forward_mqa()` [L600-675] -- 入口点
 
-Same dispatch structure as NVIDIA:
+与 NVIDIA 相同的分发结构：
 
-1. If `attn_metadata is None` (dummy warmup run): reserve workspace and zero output.
-2. Split into prefill and decode segments.
-3. Call `_forward_prefill()` on `q[num_decode_tokens:]`.
-4. Call `_forward_decode()` on `q[:num_decode_tokens]`.
+1. 如果 `attn_metadata is None`（虚拟预热运行）：预留工作空间并将输出置零。
+2. 拆分为 prefill 和解码段。
+3. 对 `q[num_decode_tokens:]` 调用 `_forward_prefill()`。
+4. 对 `q[:num_decode_tokens]` 调用 `_forward_decode()`。
 
 ### `_forward_decode()` [L677-738]
 
@@ -172,107 +172,107 @@ Same dispatch structure as NVIDIA:
 forward_decode
   ├── C4A (compress_ratio==4)
   │     └── compute_global_topk_ragged_indices_and_indptr(layer.topk_indices_buffer)
-  │           ├── _compute_topk_lens_kernel (count valid per token)
+  │           ├── _compute_topk_lens_kernel (统计每个 token 的有效条目)
   │           ├── _build_indptr_from_lengths (cumsum -> indptr)
-  │           └── _pack_global_topk_ragged_kernel (block-table lookup, flat output)
+  │           └── _pack_global_topk_ragged_kernel (块表查找，扁平输出)
   │
   ├── C128A (compress_ratio==128)
-  │     └── Use pre-built ragged from metadata:
+  │     └── 使用从元数据预构建的不规则格式：
   │         attn_metadata.c128a_decode_topk_ragged_indices
   │         attn_metadata.c128a_decode_topk_ragged_indptr
   │
   └── rocm_sparse_attn_decode(q, kv_cache, swa_k_cache, topk_*, swa_*, ...)
         ├── topk_ragged_indices + topk_ragged_indptr
-        ├── swa_ragged_indices + swa_ragged_indptr  (from SWA metadata)
-        └── Output: attention result
+        ├── swa_ragged_indices + swa_ragged_indptr  (来自 SWA 元数据)
+        └── 输出：注意力结果
 ```
 
-Key differences from NVIDIA decode:
-- NVIDIA passes `topk_indices` (dense) into `flash_mla_with_kvcache` via `extra_indices_in_kvcache`.
-- ROCm passes `topk_ragged_indices` + `topk_ragged_indptr` as separate arguments to `rocm_sparse_attn_decode`.
-- ROCm also passes `swa_ragged_indices` + `swa_ragged_indptr` (the ragged conversion of the SWA decode indices), while NVIDIA passes dense `swa_indices` directly.
+与 NVIDIA 解码的关键区别：
+- NVIDIA 通过 `extra_indices_in_kvcache` 将 `topk_indices`（稠密）传递给 `flash_mla_with_kvcache`。
+- ROCm 将 `topk_ragged_indices` + `topk_ragged_indptr` 作为单独的参数传递给 `rocm_sparse_attn_decode`。
+- ROCm 还传递了 `swa_ragged_indices` + `swa_ragged_indptr`（SWA 解码索引的不规则转换），而 NVIDIA 直接传递稠密的 `swa_indices`。
 
 ### `_forward_prefill()` [L740-856]
 
 ```
-forward_prefill (chunked, chunk_size=4)
+forward_prefill (分块，chunk_size=4)
   │
-  ├── for each chunk:
-  │     ├── Dequantize + gather compressed K cache (if not SWA-only)
-  │     │     └── dequantize_and_gather_k_cache (shared ops, same as NVIDIA)
-  │     ├── Dequantize + gather SWA K cache
-  │     │     └── dequantize_and_gather_k_cache (shared ops, same as NVIDIA)
-  │     ├── Combine topk + SWA indices
-  │     │     └── combine_topk_swa_indices (AMD-specific version, L118-165)
+  ├── 对每个 chunk：
+  │     ├── 反量化并收集压缩的 K 缓存（如果不是仅 SWA）
+  │     │     └── dequantize_and_gather_k_cache（共享算子，与 NVIDIA 相同）
+  │     ├── 反量化并收集 SWA K 缓存
+  │     │     └── dequantize_and_gather_k_cache（共享算子，与 NVIDIA 相同）
+  │     ├── 合并 topk + SWA 索引
+  │     │     └── combine_topk_swa_indices（AMD 特定版本，L118-165）
   │     └── rocm_sparse_attn_prefill(q, kv, combined_indices, combined_lens, ...)
   │
-  └── Output: chunked attention result
+  └── 输出：分块注意力结果
 ```
 
-Key differences from NVIDIA prefill:
-- Both use the shared `dequantize_and_gather_k_cache` from common ops.
-- Both call `combine_topk_swa_indices` but ROCm uses its **AMD-specific** version (not the shared one from `cache_utils.py`).
-- NVIDIA calls `flash_mla_sparse_fwd` with `combined_indices.unsqueeze(1)`; ROCm calls `rocm_sparse_attn_prefill`.
+与 NVIDIA prefill 的关键区别：
+- 两者都使用来自公共算子的共享 `dequantize_and_gather_k_cache`。
+- 两者都调用 `combine_topk_swa_indices`，但 ROCm 使用其 **AMD 特定**版本（而不是来自 `cache_utils.py` 的共享版本）。
+- NVIDIA 使用 `combined_indices.unsqueeze(1)` 调用 `flash_mla_sparse_fwd`；ROCm 调用 `rocm_sparse_attn_prefill`。
 
 ---
 
-## The Two `combine_topk_swa_indices` Variants
+## 两种 `combine_topk_swa_indices` 变体
 
-### Shared/Common Version (`common/ops/cache_utils.py`)
+### 共享/通用版本（`common/ops/cache_utils.py`，详见 [[DeepseekV4_KVCache_Ops#combine_topk_swa_indices]]）
 
-Used by both NVIDIA prefill and available for general use. Outputs **dense padded** combined indices.
+被 NVIDIA prefill 使用，也可供通用使用。输出**稠密填充**的合并索引。
 
-- Padding aligns to `_SPARSE_PREFILL_TOPK_ALIGNMENT=128`.
-- The kernel assumes all `topk_indices` entries are valid within `topk_len`.
-- Constraint enforced by the caller: `topk_indices` **must not contain -1 padding** at the shared level.
+- 填充对齐到 `_SPARSE_PREFILL_TOPK_ALIGNMENT=128`。
+- 内核假定所有 `topk_indices` 条目在 `topk_len` 范围内都是有效的。
+- 调用方强制约束：`topk_indices` 在共享级别**不得包含 -1 填充**。
 
-### AMD-Specific Version (`amd/rocm.py`, L118-165)
+### AMD 特定版本（`amd/rocm.py`，L118-165）
 
-Used by ROCm prefill. Also outputs **dense padded** combined indices (prefill still uses dense for combine), but includes an extra `TOPK_WIDTH` parameter.
+由 ROCm prefill 使用。也输出**稠密填充**的合并索引（prefill 仍使用稠密进行合并），但包含一个额外的 `TOPK_WIDTH` 参数。
 
-**Why `TOPK_WIDTH` is needed**: ROCm's topk indices may have a physical width (`topk_width`) larger than the logical `TOP_K`. For example, the allocated buffer might be sized for `max_topk=256` while only `topk=64` entries are valid per token. The AMD kernel:
+**为什么需要 `TOPK_WIDTH`**：ROCm 的 topk 索引可能有一个大于逻辑 `TOP_K` 的物理宽度（`topk_width`）。例如，分配的缓冲区可能按 `max_topk=256` 大小设置，而每个 token 只有 `topk=64` 个有效条目。AMD 内核：
 
-1. Loads safely using `TOPK_WIDTH` (the actual stride/width of `topk_indices`).
-2. Masks to `topk_len` via `TOP_K`.
-3. Filters invalid indices: `(topk_indices >= 0) & (topk_indices < N)` -- the shared version does not re-check validity because the common caller ensures no -1 entries make it into the combine step.
+1. 使用 `TOPK_WIDTH`（`topk_indices` 的实际步长/宽度）安全地加载。
+2. 通过 `TOP_K` 掩码到 `topk_len` 范围。
+3. 过滤无效索引：`(topk_indices >= 0) & (topk_indices < N)` —— 共享版本不重新检查有效性，因为通用调用方确保没有 -1 条目进入合并步骤。
 
-The `PADDED_TOP_K` is computed as `triton.next_power_of_2(topk_width)` for Triton block sizing, while the NVIDIA version uses `next_power_of_2` over `topk` (not `topk_width`).
+`PADDED_TOP_K` 计算为 `triton.next_power_of_2(topk_width)` 用于 Triton 块大小，而 NVIDIA 版本使用 `next_power_of_2` 作用于 `topk`（而不是 `topk_width`）。
 
-### AMD-Specific Ragged Variant (`amd/rocm.py`, L370-424)
+### AMD 特定不规则变体（`amd/rocm.py`，L370-424）
 
-`combine_topk_swa_indices_ragged` produces ragged output directly instead of dense padded. It:
+`combine_topk_swa_indices_ragged` 直接输出不规则格式而不是稠密填充。它：
 
-1. Pre-computes combined lengths via `_compute_combined_lens_kernel` (separate pass).
-2. Builds indptr from those lengths.
-3. Launches `_combine_topk_swa_indices_ragged_kernel` with a 3D grid `(num_reqs, 128 workers, cdiv(topk+window, 128) blocks)` to write directly into the ragged flat buffer.
+1. 通过 `_compute_combined_lens_kernel` 预计算合并后的 lengths（单独 pass）。
+2. 从这些 lengths 构建 indptr。
+3. 启动 `_combine_topk_swa_indices_ragged_kernel`，使用三维网格 `(num_reqs, 128 workers, cdiv(topk+window, 128) blocks)` 直接写入不规则扁平缓冲区。
 
-This ragged variant is not currently used in the main forward pass but exists as a building block for potential future use where the ROCm prefill kernel could accept ragged input directly.
+这个不规则变体目前未在主前向传递中使用，但作为一个构件存在，用于未来 ROCm prefill 内核可能直接接受不规则输入的潜在用途。
 
 ---
 
-## Key Differences from NVIDIA's FlashMLASparseImpl
+## 与 NVIDIA FlashMLASparseImpl 的关键区别
 
-| Aspect | NVIDIA (`flashmla.py`) | AMD (`rocm.py`) |
+| 方面 | NVIDIA（`flashmla.py`） | AMD（`rocm.py`） |
 |--------|----------------------|-----------------|
-| **Sparse indices format** | Dense padded 2D tensors | Ragged 1D + indptr (CSR-like) |
-| **Decode attention kernel** | `flash_mla_with_kvcache` (CUDA) | `rocm_sparse_attn_decode` (Triton) |
-| **Prefill attention kernel** | `flash_mla_sparse_fwd` (CUDA) | `rocm_sparse_attn_prefill` (Triton) |
-| **Q head padding** | Pads to 64 or 128 (`get_padded_num_q_heads`) | No padding (returns `num_heads` unchanged) |
-| **C4A decode topk** | `compute_global_topk_indices_and_lens` (dense output) | `compute_global_topk_ragged_indices_and_indptr` (ragged output) |
-| **C128A ragged build** | Not needed (kernel consumes dense) | Built from dense parent via `build_ragged_indices_from_dense` |
-| **SWA ragged build** | Not needed | Built from dense parent via `build_ragged_indices_from_dense` |
-| **`combine_topk_swa_indices`** | Uses shared version from `cache_utils.py` | Uses AMD-specific version with `TOPK_WIDTH` guard |
-| **Prefill chunk size** | 4 (same constant) | 4 (same constant) |
-| **`_forward_decode` signature** | Takes `FlashMLASparseMetadata` | Takes `DeepseekV4ROCMAiterMLASparseMetadata` |
-| **Dequantize/gather KV** | Same shared `dequantize_and_gather_k_cache` | Same shared `dequantize_and_gather_k_cache` |
+| **稀疏索引格式** | 稠密填充的二维张量 | 不规则一维 + indptr（类 CSR） |
+| **解码注意力内核** | `flash_mla_with_kvcache`（CUDA） | `rocm_sparse_attn_decode`（Triton） |
+| **Prefill 注意力内核** | `flash_mla_sparse_fwd`（CUDA） | `rocm_sparse_attn_prefill`（Triton） |
+| **Q 头填充** | 填充到 64 或 128（`get_padded_num_q_heads`） | 无填充（原样返回 `num_heads`） |
+| **C4A 解码 topk** | `compute_global_topk_indices_and_lens`（稠密输出） | `compute_global_topk_ragged_indices_and_indptr`（不规则输出） |
+| **C128A 不规则构建** | 不需要（内核直接消费稠密） | 通过 `build_ragged_indices_from_dense` 从稠密父类构建 |
+| **SWA 不规则构建** | 不需要 | 通过 `build_ragged_indices_from_dense` 从稠密父类构建 |
+| **`combine_topk_swa_indices`** | 使用来自 `cache_utils.py` 的共享版本 | 使用带有 `TOPK_WIDTH` 保护的 AMD 特定版本 |
+| **Prefill 块大小** | 4（相同常量） | 4（相同常量） |
+| **`_forward_decode` 签名** | 接收 `FlashMLASparseMetadata` | 接收 `DeepseekV4ROCMAiterMLASparseMetadata` |
+| **反量化/收集 KV** | 相同的共享 `dequantize_and_gather_k_cache` | 相同的共享 `dequantize_and_gather_k_cache` |
 
 ---
 
-## Helper Utilities
+## 辅助工具
 
 ### `_build_indptr_from_lengths` [L40-44]
 
-Converts a lengths tensor to a CSR-style indptr via `cumsum`:
+通过 `cumsum` 将 lengths 张量转换为 CSR 风格的 indptr：
 
 ```python
 indptr = zeros(len(lengths) + 1)
@@ -281,19 +281,19 @@ cumsum(lengths, out=indptr[1:])
 
 ### `compute_global_topk_ragged_indices_and_indptr` [L236-277]
 
-Three-step pipeline for C4A decode:
-1. `_compute_topk_lens_kernel`: Counts valid (>=0) entries per token, zeros out invalid tokens.
-2. `_build_indptr_from_lengths`: Builds the ragged indptr.
-3. `_pack_global_topk_ragged_kernel`: Resolves local indices to global KV cache slots via block table lookup and writes to the flat ragged buffer.
+C4A 解码的三步流程：
+1. `_compute_topk_lens_kernel`：统计每个 token 的有效（>=0）条目数，将无效 token 置零。
+2. `_build_indptr_from_lengths`：构建不规则 indptr。
+3. `_pack_global_topk_ragged_kernel`：通过块表查找将局部索引解析为全局 KV 缓存槽位，并写入扁平不规则缓冲区。
 
 ### `_copy_ragged_to_graph_buffers` [L427-448]
 
-Copies ragged metadata into pre-allocated persistent CUDA graph buffers using `non_blocking=True` H2D copies.
+使用 `non_blocking=True` 的 H2D 复制，将不规则元数据复制到预分配的持久 CUDA 图缓冲区中。
 
 ---
 
-## Related Cross-References
+## 相关交叉引用
 
-- [[DeepseekV4_KVCache_Ops]] -- Shared K-cache operations and the common `combine_topk_swa_indices`.
-- [[V1AttentionBackend]] -- The framework of attention backends, metadata builders, and CUDA graph integration.
-- [[NvidiaVsAMD]] -- Architectural comparison between the NVIDIA FlashMLA and AMD ROCm Aiter backends.
+- [[DeepseekV4_KVCache_Ops]] -- 共享的 K 缓存操作和通用的 `combine_topk_swa_indices`。
+- [[V1AttentionBackend]] -- 注意力后端、元数据构建器和 CUDA 图集成的框架。
+- [[NvidiaVsAMD]] -- NVIDIA FlashMLA 和 AMD ROCm Aiter 后端之间的架构比较。

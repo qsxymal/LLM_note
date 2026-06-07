@@ -370,7 +370,7 @@ self.shared_experts = DeepseekV4MLP(
 
 ## 10. 关键算子：`prepare_megamoe_inputs`
 
-**位置：** `vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py`
+**位置：** `vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py`，详见 [[PrepareMegaMoEInputs]]
 
 这是一个 Triton kernel，将 `hidden_states`（bf16）量化为 FP8 E4M3 并打包成 DeepGEMM 所需的输入布局。
 
@@ -564,3 +564,12 @@ if success:
 - **与 V3/V3.2 MoE 的对比**：DeepSeek V3 的 MoE 实现与 V4 的差异（尤其是 FP4 支持）
 - **EP vs TP 的性能对比**：在 DeepSeek V4 规模下 EP 替代 TP 带来的通信收益量化
 - **Hash MoE 的 effect**：前 `num_hash_layers` 层的 hash 路由对负载均衡的影响
+
+---
+
+## 相关笔记
+
+- [[PrepareMegaMoEInputs]] — `nvidia/ops/` 下的 MegaMoE 输入 FP8 量化 Triton 内核
+- [[DeepseekV4FP8Config]] — 量化配置分发，控制 `expert_dtype`（FP4 vs FP8）
+- [[GateRouting]] — 门控路由数学：sqrtsoftplus、Hash MoE、Noaux TC
+- [[QuantAndParallelStrategy]] — MoE 路径的量化与并行策略

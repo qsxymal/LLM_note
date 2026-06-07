@@ -1,243 +1,246 @@
-# FusedIndexerQ -- Fused RoPE + Quantize Q for the Sparse Indexer
+# FusedIndexerQ -- 稀疏 Indexer 的融合 RoPE + 量化 Q
 
-**File:** `vllm/models/deepseek_v4/common/ops/fused_indexer_q.py` (Triton fallback)
+**文件：** `vllm/models/deepseek_v4/common/ops/fused_indexer_q.py`（Triton 备选）
+**所属模块族：** [[common_ops]] 跨平台融合操作算子（Triton 实现）；另有 `nvidia/ops/fused_indexer_q_cutedsl.py`（CuteDSL 实现，仅 SM100）
 
-Fused kernel that applies **forward GPT-J interleaved RoPE** to the indexer's Q projection, quantizes the result, and folds the Q scale into indexer weights. Two quantization paths are supported: **FP8** (default) and **MXFP4** (`use_fp4=True`).
+融合内核，对 indexer 的 Q 投影应用**正向 GPT-J 交错 RoPE**，量化结果，并将 Q 缩放因子折叠到 indexer 权重中。支持两种量化路径：**FP8**（默认）和 **MXFP4**（`use_fp4=True`）。
 
-**Relationship with [[FusedInvRopeFP8Quant]]:** These two are the RoPE + quantization fusion pair for opposite ends of the attention pipeline. `FusedIndexerQ` processes the **Q-side** (pre-attention, applying forward RoPE). `FusedInvRopeFP8Quant` processes the **O-side** (post-attention, applying inverse RoPE). Both use GPT-J interleaved RoPE, block-scaled quantization, and Triton backends, but differ in their scale management strategy.
+**与 [[FusedInvRopeFP8Quant]] 的关系：** 这两个是注意力流水线两端的 RoPE + 量化融合对。`FusedIndexerQ` 处理 **Q 侧**（注意力之前，应用正向 RoPE）。`FusedInvRopeFP8Quant` 处理 **O 侧**（注意力之后，应用逆 RoPE）。两者都使用 GPT-J 交错 RoPE、块缩放量化和 Triton 后端，但在缩放因子管理策略上有所不同。
 
-## 1. Inputs and Outputs
+## 1. 输入和输出
 
-### Inputs
+### 输入
 
-| Tensor | Shape | dtype | Description |
+| 张量 | 形状 | dtype | 描述 |
 |--------|-------|-------|-------------|
-| `positions` | `(T,)` | int64 | Token positions for RoPE cos/sin lookup. |
-| `index_q` | `(T, H, head_dim)` | bf16 | Q projection from the indexer. `head_dim = 128`. |
-| `index_q_cos_sin_cache` | `(max_pos, rope_dim)` | bf16/f32 | Precomputed RoPE cos/sin. `rope_dim = 64` for H128 indexer head. |
-| `index_weights` | `(T, H)` | bf16 | Scalar weight per (token, head) from the sparse indexer. |
+| `positions` | `(T,)` | int64 | 用于 RoPE cos/sin 查找的 token 位置。 |
+| `index_q` | `(T, H, head_dim)` | bf16 | 来自 indexer 的 Q 投影。`head_dim = 128`。 |
+| `index_q_cos_sin_cache` | `(max_pos, rope_dim)` | bf16/f32 | 预计算的 RoPE cos/sin。对于 H128 indexer 头，`rope_dim = 64`。 |
+| `index_weights` | `(T, H)` | bf16 | 来自稀疏 indexer 的每个 (token, head) 标量权重。 |
 
-### Parameters
+### 参数
 
-| Parameter | Type | Description |
+| 参数 | 类型 | 描述 |
 |-----------|------|-------------|
-| `index_weights_softmax_scale` | float | Softmax temperature scaling factor. |
-| `index_weights_head_scale` | float | Per-head scaling factor (typically loaded from weights). |
-| `use_fp4` | bool | Selects MXFP4 path when True (default: False = FP8). |
+| `index_weights_softmax_scale` | float | Softmax 温度缩放因子。 |
+| `index_weights_head_scale` | float | 每头缩放因子（通常从权重加载）。 |
+| `use_fp4` | bool | 为 True 时选择 MXFP4 路径（默认：False = FP8）。 |
 
-### Outputs
+### 输出
 
-| Path | Output | Shape | dtype | Description |
+| 路径 | 输出 | 形状 | dtype | 描述 |
 |------|--------|-------|-------|-------------|
-| FP8 | `q_fp8` | `(T, H, head_dim)` | float8_e4m3fn | Quantized Q, **no companion scale tensor**. Scale is folded into `weights_out`. |
+| FP8 | `q_fp8` | `(T, H, head_dim)` | float8_e4m3fn | 量化后的 Q，**没有伴随的缩放张量**。缩放因子被折叠到 `weights_out` 中。 |
 | FP8 | `weights_out` | `(T, H)` | float32 | `weights * q_scale * softmax_scale * head_scale` |
-| MXFP4 | `q_packed` | `(T, H, head_dim // 2)` | uint8 | 2 E2M1 nibbles per byte (packed values). |
-| MXFP4 | `q_scale` | `(T, H, num_blocks)` | uint8 (ue8m0) | Per-block exponent-only scale. `num_blocks = head_dim // 32`. |
-| MXFP4 | `weights_out` | `(T, H)` | float32 | `weights * softmax_scale * head_scale` (NO q_scale fold). |
+| MXFP4 | `q_packed` | `(T, H, head_dim // 2)` | uint8 | 每字节 2 个 E2M1 半字节（打包值）。 |
+| MXFP4 | `q_scale` | `(T, H, num_blocks)` | uint8 (ue8m0) | 每块仅指数缩放因子。`num_blocks = head_dim // 32`。 |
+| MXFP4 | `weights_out` | `(T, H)` | float32 | `weights * softmax_scale * head_scale`（不折叠 q_scale）。 |
 
-## 2. Weight-Fold Design Rationale
+## 2. 权重折叠设计原理
 
-The central design difference between the two paths:
+两条路径之间的核心设计区别：
 
-### FP8 Path (Default)
+### FP8 路径（默认）
 
 ```
 weights_out = index_weights * q_scale * softmax_scale * head_scale
 ```
 
-- Q uses a **single per-token per-head scalar** scale factor.
-- This scalar is folded into `weights_out` so the downstream FP8 logits kernel does not need to load and multiply it separately.
-- No companion scale tensor is emitted for `q_fp8`.
-- The downstream `fp8_fp4_mqa_logits` / `fp8_fp4_paged_mqa_logits` kernels use the pre-scaled `weights` to apply the per-token Q scale inline.
+- Q 使用**单个每 token 每头标量**缩放因子。
+- 该标量被折叠到 `weights_out` 中，因此下游 FP8 logits 内核无需单独加载和乘以它。
+- 不为 `q_fp8` 生成伴随的缩放张量。
+- 下游 `fp8_fp4_mqa_logits` / `fp8_fp4_paged_mqa_logits` 内核使用预先缩放的 `weights` 来内联应用每 token Q 缩放。
 
-### MXFP4 Path
+### MXFP4 路径
 
 ```
 weights_out = index_weights * softmax_scale * head_scale
 ```
 
-- Q uses **per-block** (32-element) scales that live alongside the packed values in a separate tensor.
-- These per-block scales **cannot** be folded into a single per-token weight scalar.
-- The `q_scale` tensor is emitted separately (ue8m0 format).
-- The downstream MXFP4 logits kernel dequantizes Q by reading both `q_packed` and `q_scale` together.
-- `weights_out` carries only the softmax and head scales.
+- Q 使用**每块**（32 元素）缩放因子，这些缩放因子与打包值一起存在于一个单独的张量中。
+- 这些每块缩放因子**无法**折叠到单个每 token 权重标量中。
+- `q_scale` 张量单独输出（ue8m0 格式）。
+- 下游 MXFP4 logits 内核通过同时读取 `q_packed` 和 `q_scale` 来去量化 Q。
+- `weights_out` 仅携带 softmax 和头缩放因子。
 
-### Why Not Always Fold?
+### 为什么不全折叠？
 
-| Aspect | FP8 fold | MXFP4 no-fold |
+| 方面 | FP8 折叠 | MXFP4 不折叠 |
 |--------|----------|---------------|
-| Scale granularity | 1 scalar per (t, h) | 1 scale per 32 elements (`num_blocks` per head) |
-| Fold feasible? | Yes -- single scalar is trivially folded into weights | No -- `num_blocks` scales cannot be collapsed into a single weight |
-| Extra tensor | None | `q_scale` output tensor needed |
-| Downstream kernel shape | Uses pre-scaled weights directly | Must load + apply per-block scales during dequant |
+| 缩放因子粒度 | 每个 (t, h) 1 个标量 | 每 32 元素 1 个缩放因子（每头 `num_blocks` 个） |
+| 折叠可行？ | 是——单个标量轻松折叠到权重中 | 否——`num_blocks` 个缩放因子无法合并到单个权重中 |
+| 额外张量 | 无 | 需要 `q_scale` 输出张量 |
+| 下游内核形状 | 直接使用预先缩放的权重 | 必须在去量化期间加载并应用每块缩放因子 |
 
-## 3. RoPE Algorithm (GPT-J Interleaved, Forward)
+## 3. RoPE 算法（GPT-J 交错，正向）
 
-Applied to the **last** `rope_dim` elements of each head. The leading `nope_dim = head_dim - rope_dim` elements pass through unchanged.
+应用于每头的**最后** `rope_dim` 个元素。前导的 `nope_dim = head_dim - rope_dim` 元素保持不变。
 
-### Forward Rotation
+### 正向旋转
 
 ```
-For each i in [0, rope_dim/2):
-    even_idx = nope_dim + 2*i        # even index in rope region
-    odd_idx  = nope_dim + 2*i + 1    # odd index in rope region
+对于每个 i in [0, rope_dim/2):
+    even_idx = nope_dim + 2*i        # rope 区域中的偶数索引
+    odd_idx  = nope_dim + 2*i + 1    # rope 区域中的奇数索引
 
     x_even = q[even_idx]
     x_odd  = q[odd_idx]
 
-    r_even = x_even * cos[i] - x_odd * sin[i]    # forward rotation (even)
-    r_odd  = x_odd * cos[i] + x_even * sin[i]    # forward rotation (odd)
+    r_even = x_even * cos[i] - x_odd * sin[i]    # 正向旋转（偶数）
+    r_odd  = x_odd * cos[i] + x_even * sin[i]    # 正向旋转（奇数）
 ```
 
-Contrast with [[FusedInvRopeFP8Quant]] where the inverse rotation uses `+ partner*sin` on the even branch.
+与 [[FusedInvRopeFP8Quant]] 对比，其中逆旋转在偶数分支上使用 `+ partner*sin`。
 
-### BFloat16 Roundtrip for Numerical Parity
+### 用于数值一致性的 BFloat16 往返
 
-Both the nope and rope halves follow this sequence before absmax:
+nope 和 rope 两半在 absmax 之前都遵循以下序列：
 
 ```
 fp32 -> bf16 -> fp32
 ```
 
-This is done explicitly in the kernel (L123-124 for FP8 kernel, L259-260 for MXFP4 kernel). The comment notes: *"Same pattern as the K-side compressor kernel"* ([[DeepseekCompressor]]). This ensures numerical parity between the fused kernel and the unfused reference (which would have naturally rounded through a bf16 write-back between RoPE and quant).
+在内核中显式执行（FP8 内核的第 123-124 行，MXFP4 内核的第 259-260 行）。注释指出：*"与 K 侧压缩器内核相同的模式"*（[[DeepseekCompressor]]）。这确保了融合内核与非融合参考（后者在 RoPE 和量化之间会自然通过 bf16 写回进行舍入）之间的数值一致性。
 
-In the FP8 kernel:
+在 FP8 内核中：
 ```python
 r_even = r_even.to(tl.bfloat16).to(tl.float32)
 r_odd  = r_odd.to(tl.bfloat16).to(tl.float32)
 ```
 
-### Cos/Sin Lookup
+### Cos/Sin 查找
 
 ```python
 cos = cos_sin_cache[pos, 0:HALF_ROT_DIM]
 sin = cos_sin_cache[pos, HALF_ROT_DIM:ROT_DIM]
 ```
 
-The cache stores cos and sin contiguously: `[cos_0..cos_{H-1}, sin_0..sin_{H-1}]`.
+缓存连续存储 cos 和 sin：`[cos_0..cos_{H-1}, sin_0..sin_{H-1}]`。
 
-## 4. FP8 Quant Path
+## 4. FP8 量化路径
 
 ```
-Scale computation:
+缩放因子计算：
     amax = max(|nope_values|, |rotated_even|, |rotated_odd|)
     q_scale = round_nearest(amax, tol=1e-4) / 448.0    # div_rn
-    q_scale = 2^ceil(log2(q_scale))                    # round up to pow2
+    q_scale = 2^ceil(log2(q_scale))                    # 向上舍入到 2 的幂
 
-Quantization:
-    q_fp8[t, h, d] = clamp(q_bf16 / q_scale, -448, 447)  cast to float8_e4m3fn
+量化：
+    q_fp8[t, h, d] = clamp(q_bf16 / q_scale, -448, 447) 转换为 float8_e4m3fn
 ```
 
-- The entire head shares a single scalar scale.
-- `448.0` = max representable value in `float8_e4m3fn`.
-- Scale is rounded UP to a power of 2 (ensures no overflow).
+- 整个头共享一个单一的标量缩放因子。
+- `448.0` = `float8_e4m3fn` 中的最大可表示值。
+- 缩放因子向上舍入到 2 的幂（确保不会溢出）。
 
-## 5. MXFP4 Quant Path
+## 5. MXFP4 量化路径
 
-### MXFP4 Format
+### MXFP4 格式
 
-| Component | Bits | Description |
+| 组件 | 比特数 | 描述 |
 |-----------|------|-------------|
-| Element | E2M1 (4-bit) | 2 exponent bits, 1 mantissa bit, sign. Range: [-6, +6]. |
-| Block size | 32 elements | 1 scale per block. |
-| Packing | 2 nibbles/byte | Even-index value in low nibble, odd-index in high nibble. |
-| Scale | ue8m0 (8-bit) | Unsigned exponent-only: `scale = 2^(ue8m0 - 127)`. |
+| 元素 | E2M1（4 位） | 2 个指数位，1 个尾数位，带符号。范围：[-6, +6]。 |
+| 块大小 | 32 元素 | 每块 1 个缩放因子。 |
+| 打包 | 每字节 2 个半字节 | 偶数索引值在低半字节，奇数索引值在高半字节。 |
+| 缩放因子 | ue8m0（8 位） | 无符号仅指数：`scale = 2^(ue8m0 - 127)`。 |
 
-### Block Quantization (`_quantize_mxfp4_pair`)
+### 块量化（`_quantize_mxfp4_pair`）
 
-The kernel processes 32-element blocks in groups of 16 pairs:
+内核以 16 对为一组处理 32 元素块：
 
 ```python
-# Each invocation handles 16 even + 16 odd values (= 32 elements = 1 MXFP4 block)
+# 每次调用处理 16 个偶数 + 16 个奇数值（= 32 元素 = 1 个 MXFP4 块）
 amax = max(|x_lo|, |x_hi|)
-amax = max(amax, 6.0 * 2^-126)        # floor from DeepSeek reference kernel
+amax = max(amax, 6.0 * 2^-126)        # 来自 DeepSeek 参考内核的下限
 
-log2_ratio = ceil(log2(amax / 6.0))    # 6.0 = max of E2M1
+log2_ratio = ceil(log2(amax / 6.0))    # 6.0 = E2M1 的最大值
 log2_ratio = clamp(log2_ratio, -127, 127)
 scale = 2^log2_ratio
-ue8m0 = uint8(log2_ratio + 127)        # bias = 127
+ue8m0 = uint8(log2_ratio + 127)        # 偏置 = 127
 
-# FP4 quant via inline PTX:
+# 通过内联 PTX 进行 FP4 量化：
 #   cvt.rn.satfinite.e2m1x2.f32 tmp, x_hi, x_lo;
-packed = inline_asm_elementwise(...)  # returns uint8
+packed = inline_asm_elementwise(...)  # 返回 uint8
 ```
 
-The PTX intrinsic `cvt.rn.satfinite.e2m1x2.f32` converts two f32 values to a pair of E2M1 values packed into one byte.
+PTX 内联函数 `cvt.rn.satfinite.e2m1x2.f32` 将两个 f32 值转换为一对 E2M1 值，打包到一个字节中。
 
-### MXFP4 RoPE Block Loop
+### MXFP4 RoPE 块循环
 
-In the MXFP4 path, the RoPE region is processed in `NUM_ROPE_BLOCKS` iterations, each handling `MXFP4_BLOCK_SIZE = 32` elements:
+在 MXFP4 路径中，RoPE 区域在 `NUM_ROPE_BLOCKS` 次迭代中处理，每次处理 `MXFP4_BLOCK_SIZE = 32` 个元素：
 
 ```python
 for b in static_range(NUM_ROPE_BLOCKS):
-    # Load 16 pairs of cos/sin for this block
+    # 为该块加载 16 对 cos/sin
     pair_off = b * 16 + tid  # tid = [0, 16)
 
-    # Apply GPT-J RoPE to the block's 16 pairs
+    # 将 GPT-J RoPE 应用于块的 16 对
     r_even = x_even * cos - x_odd * sin
     r_odd  = x_odd * cos + x_even * sin
 
-    # bf16 roundtrip (numerical parity)
+    # bf16 往返（数值一致性）
     r_even = r_even.to(bf16).to(fp32)
     r_odd  = r_odd.to(bf16).to(fp32)
 
-    # Quantize pair and store packed result + ue8m0 scale
+    # 量化对并存储打包结果 + ue8m0 缩放因子
     packed, ue8m0 = _quantize_mxfp4_pair(r_even, r_odd)
     store(out_base + rope_byte_off + half_off, packed)
     store(scale_base + NUM_NOPE_BLOCKS + b, ue8m0)
 ```
 
-## 6. Code Structure: CuteDSL vs Triton Fallback
+## 6. 代码结构：CuteDSL vs Triton 备选
 
-The common entry point `fused_indexer_q_rope_quant` dispatches based on hardware availability:
+公共入口点 `fused_indexer_q_rope_quant` 根据硬件可用性进行分派：
 
 ```
 fused_indexer_q_rope_quant()
     |
-    ├── has_cutedsl() == True (SM100 CUDA)
+    ├── has_cutedsl() == True（SM100 CUDA）
     │   └── vllm/models/deepseek_v4/nvidia/ops/fused_indexer_q_cutedsl.py
     │       ├── fused_indexer_q_rope_quant_mxfp4_cutedsl()
     │       └── fused_indexer_q_rope_quant_fp8_cutedsl()
     │
-    └── has_cutedsl() == False (SM90 or non-NVIDIA)
-        └── vllm/models/deepseek_v4/common/ops/fused_indexer_q.py (THIS FILE)
-            ├── _fused_indexer_q_rope_quant_kernel    (Triton, FP8 path)
-            └── _fused_indexer_q_rope_mxfp4_kernel     (Triton, MXFP4 path)
+    └── has_cutedsl() == False（SM90 或非 NVIDIA）
+        └── vllm/models/deepseek_v4/common/ops/fused_indexer_q.py（本文件）
+            ├── _fused_indexer_q_rope_quant_kernel    （Triton，FP8 路径）
+            └── _fused_indexer_q_rope_mxfp4_kernel     （Triton，MXFP4 路径）
 ```
 
-### Triton Kernel Details
+### Triton 内核详情
 
-Both Triton kernels use a **1D launch grid** of `(num_tokens, num_index_q_heads)` -- one program per (token, head) pair with **1 warp each**.
+两个 Triton 内核都使用 `(num_tokens, num_index_q_heads)` 的 **1D 启动网格**——每个 (token, head) 对一个程序，**每个程序 1 个 warp**。
 
-| Aspect | FP8 Kernel | MXFP4 Kernel |
+| 方面 | FP8 内核 | MXFP4 内核 |
 |--------|------------|--------------|
-| Triton function | `_fused_indexer_q_rope_quant_kernel` | `_fused_indexer_q_rope_mxfp4_kernel` |
-| Output values | `index_q_fp8` (float8_e4m3fn) | `index_q_packed` (uint8) + `index_q_scale` (uint8 ue8m0) |
-| Scale fold | Yes, into `weights_out` | No, separate `q_scale` output |
-| Input layout | Direct `index_q` (no transpose) | Same |
-| NoPE blocks | Single `tl.load` | Loop over `NUM_NOPE_BLOCKS` |
-| RoPE blocks | Single load + rotate | Loop over `NUM_ROPE_BLOCKS` |
-| Inline PTX | None | `cvt.rn.satfinite.e2m1x2.f32` for FP4 packing |
+| Triton 函数 | `_fused_indexer_q_rope_quant_kernel` | `_fused_indexer_q_rope_mxfp4_kernel` |
+| 输出值 | `index_q_fp8`（float8_e4m3fn） | `index_q_packed`（uint8）+ `index_q_scale`（uint8 ue8m0） |
+| 缩放因子折叠 | 是，折叠到 `weights_out` 中 | 否，单独的 `q_scale` 输出 |
+| 输入布局 | 直接 `index_q`（不转置） | 相同 |
+| NoPE 块 | 单个 `tl.load` | 循环遍历 `NUM_NOPE_BLOCKS` |
+| RoPE 块 | 单次加载 + 旋转 | 循环遍历 `NUM_ROPE_BLOCKS` |
+| 内联 PTX | 无 | `cvt.rn.satfinite.e2m1x2.f32` 用于 FP4 打包 |
 
-### Return Format
+### 返回格式
 
 ```python
-# FP8 path
+# FP8 路径
 return index_q_fp8, weights_out
 # index_q_fp8: (T, H, head_dim) float8_e4m3fn
 
-# MXFP4 path
+# MXFP4 路径
 return (index_q_packed, index_q_scale.view(int32).squeeze(-1)), weights_out
 # index_q_packed: (T, H, head_dim//2) uint8
-# index_q_scale:  (T, H) int32 (after squeeze; 4 ue8m0 bytes packed per int32)
+# index_q_scale:  (T, H) int32（squeeze 后；每个 int32 打包 4 个 ue8m0 字节）
 ```
 
-The MXFP4 scale is reinterpreted as int32 and squeezed from `(T, H, 1)` to `(T, H)` to match DeepGEMM's expected `q_sf` rank (2-D for prefill, 3-D for decode after reshape).
+MXFP4 缩放因子重新解释为 int32 并从 `(T, H, 1)` squeeze 到 `(T, H)`，以匹配 DeepGEMM 期望的 `q_sf` 秩（预填充时为 2-D，reshape 后的解码时为 3-D）。
 
-## Cross-References
+## 交叉引用
 
-- [[FusedInvRopeFP8Quant]] -- counterpart for O-side inverse RoPE + quant.
-- [[DeepseekV4Indexer]] -- the indexer pipeline that consumes this kernel's output.
-- [[DeepseekV4MultiHeadLatentAttentionWrapper]] -- the MLA wrapper that calls this kernel on the auxiliary attention stream.
-- [[DeepseekCompressor]] -- another fused kernel using the same bf16-roundtrip pattern for numerical parity.
-- `fused_indexer_q_cutedsl.py` -- CuTeDSL implementation of the same operation (SM100 only).
+- [[common_ops]] — 同目录的跨平台算子总览
+- [[FusedInvRopeFP8Quant]] — O 侧逆 RoPE + 量化的对应核（同属 `common/ops/`）
+- [[DeepseekV4_KVCache_Ops#FusedCompressQuantCache]] — 同目录下使用相同 bf16 往返模式的另一融合算子
+- [[DeepseekV4Indexer]] — 消费此内核输出的 indexer 流水线
+- [[DeepseekV4MultiHeadLatentAttentionWrapper]] — 在辅助注意力流上调用此内核的 MLA 包装器
+- [[DeepseekCompressor]] — 另一个使用相同 bf16 往返模式以实现数值一致性的融合内核
+- `fused_indexer_q_cutedsl.py` — 相同操作的 CuTeDSL 实现（仅 SM100），见 [[DequantGatherKCache#相关笔记]]

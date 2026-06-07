@@ -2,6 +2,7 @@
 
 **文件路径：** `vllm/models/deepseek_v4/nvidia/ops/dequant_gather_k_cutedsl.py`
 **公开函数：** `dequantize_and_gather_k_cache_cutedsl`（`L17-L29`）
+**所属模块族：** `nvidia/ops/` — NVIDIA SM100 CuteDSL 算子族
 
 ## 1. 定位
 
@@ -74,7 +75,9 @@ for chunk_idx in range(num_chunks):
     )
 ```
 
-## Cross-References
+## 相关笔记
 
 - [[DeepseekV4FlashMLASparseImpl]]：在 `_forward_prefill` 中调用此内核
 - [[QuantAndParallelStrategy]]：FP8 KV 缓存布局（584 字节/token）
+- [[DeepseekV4_KVCache_Ops#dequantize_and_gather_k_cache]]：Triton 实现版本（功能等价），与本文件 CuteDSL 实现互为备选
+- [[SparseAttnCompress]]：同 `nvidia/ops/` 目录的姊妹内核族，另一个融合量化 + 内存访问内核

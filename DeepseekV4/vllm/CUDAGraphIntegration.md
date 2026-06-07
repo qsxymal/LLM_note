@@ -1,17 +1,17 @@
-# CUDAGraphIntegration -- How DeepSeek V4 works with CUDA graphs
+# CUDAGraphIntegration -- DeepSeek V4 如何与 CUDA 图协同工作
 
-## Overview
+## 概述
 
-DeepSeek V4's CUDA graph integration involves several mechanisms to handle the tension between CUDA graph's requirement for fixed tensor addresses and V4's dynamic runtime (variable batch size, dynamic topk indices, sparse attention, MegaMoE).
+DeepSeek V4 的 CUDA 图集成涉及多种机制，以处理 CUDA 图对固定张量地址的要求与 V4 动态运行时（可变批大小、动态 topk 索引、稀疏注意力、MegaMoE）之间的矛盾。
 
-The constraints for CUDA graph capture are:
-1. All tensor shapes and addresses must be fixed at graph capture time.
-2. Dynamic data (indices, lengths, block tables) must use pre-allocated buffers with `copy_` updates.
-3. Custom CUDA kernels (FlashMLA, MegaMoE) must be opaque to torch.compile or placed in `no_compile_layers`.
+CUDA 图捕获的约束条件如下：
+1. 所有张量形状和地址必须在图捕获时固定。
+2. 动态数据（索引、长度、块表）必须使用预分配的缓冲区并通过 `copy_` 更新。
+3. 自定义 CUDA 内核（FlashMLA、MegaMoE）必须对 `torch.compile` 不透明，或放置在 `no_compile_layers` 中。
 
-## 1. Static Forward Context for MegaMoE
+## 1. MegaMoE 的静态前向上下文
 
-File: `vllm/models/deepseek_v4/nvidia/model.py`, lines 214-219
+文件：`vllm/models/deepseek_v4/nvidia/model.py`，第 214-219 行
 
 ```python
 # Register in the static forward context so the custom-op wrapper
@@ -22,9 +22,9 @@ if prefix in compilation_config.static_forward_context:
 compilation_config.static_forward_context[prefix] = self
 ```
 
-During `DeepseekV4MegaMoEExperts.__init__`, each expert module registers itself by `prefix` into `compilation_config.static_forward_context`. This is a dictionary that maps layer name strings to module instances.
+在 `DeepseekV4MegaMoEExperts.__init__` 期间，每个专家模块通过 `prefix` 将自己注册到 `compilation_config.static_forward_context` 中。这是一个将层名称字符串映射到模块实例的字典。
 
-**Why this is needed:** Inside a `torch.compile`-captured graph, `self` (the module instance) is not accessible. The custom-op wrapper function `_deepseek_v4_mega_moe_experts_op` needs the actual module to dispatch to `_run_mega_moe`. It retrieves the module via the forward context:
+**为什么需要这样做：** 在 `torch.compile` 捕获的图内部，`self`（模块实例）是不可访问的。自定义算子包装函数 `_deepseek_v4_mega_moe_experts_op` 需要实际的模块来分派到 `_run_mega_moe`。它通过前向上下文检索模块：
 
 ```python
 # Line 422
@@ -34,15 +34,15 @@ self._run_mega_moe(hidden_states, topk_weights, topk_ids, out, ...)
 
 ## 2. no_compile_layers
 
-File: `vllm/models/deepseek_v4/nvidia/model.py`, line 422
+文件：`vllm/models/deepseek_v4/nvidia/model.py`，第 422 行
 
-`get_forward_context().no_compile_layers[layer_name]` is populated by vLLM's compilation framework. Layers listed in `no_compile_layers` are excluded from `torch.compile` graph capture. The MegaMoE expert op is a custom CUDA kernel that:
+`get_forward_context().no_compile_layers[layer_name]` 由 vLLM 的编译框架填充。列在 `no_compile_layers` 中的层被排除在 `torch.compile` 图捕获之外。MegaMoE 专家算子是一个自定义 CUDA 内核，它：
 
-- Cannot be traced by torch.compile (contains custom triton/CUDA kernels).
-- Has dynamic dispatch (expert routing based on `topk_ids`).
-- Needs access to module state (weight scales, quantization parameters).
+- 无法被 torch.compile 追踪（包含自定义 Triton/CUDA 内核）。
+- 具有动态分派（基于 `topk_ids` 的专家路由）。
+- 需要访问模块状态（权重缩放因子、量化参数）。
 
-The wrapper function signature (lines 413-421) takes all tensor inputs explicitly plus `layer_name` as a string:
+包装函数签名（第 413-421 行）显式接收所有张量输入以及作为字符串的 `layer_name`：
 
 ```python
 def _deepseek_v4_mega_moe_experts_op(
@@ -53,11 +53,11 @@ def _deepseek_v4_mega_moe_experts_op(
     self._run_mega_moe(...)
 ```
 
-This pattern allows `torch.compile` to trace the surrounding graph while treating the MegaMoE call as a black-box custom op.
+这种模式允许 `torch.compile` 追踪周围的图，同时将 MegaMoE 调用视为不透明的自定义算子。
 
-## 3. MTP Hidden Buffer (Outside CUDAGraph Pool)
+## 3. MTP 隐藏状态缓冲区（在 CUDAGraph 内存池之外）
 
-File: `vllm/models/deepseek_v4/nvidia/model.py`, lines 1169-1177
+文件：`vllm/models/deepseek_v4/nvidia/model.py`，第 1169-1177 行
 
 ```python
 if get_pp_group().is_last_rank:
@@ -71,13 +71,13 @@ else:
     self._mtp_hidden_buffer = None
 ```
 
-The MTP draft head needs to receive hidden states from the main model via `copy_`. By allocating this buffer outside the CUDA graph memory pool, the `copy_` operation in `forward()` correctly refreshes the data across captured shapes without triggering graph replay issues. The buffer is sized at `max_num_batched_tokens * hc_dim` and lives on the last PP rank only.
+MTP 草稿头需要通过 `copy_` 从主模型接收隐藏状态。通过将此缓冲区分配在 CUDA 图内存池之外，`forward()` 中的 `copy_` 操作能够正确地在已捕获的形状之间刷新数据，而不会触发图重放问题。该缓冲区的大小为 `max_num_batched_tokens * hc_dim`，且仅存在于最后一个 PP 等级上。
 
-## 4. CUDA Graph Warmup in Attention
+## 4. 注意力中的 CUDA 图预热
 
-File: `vllm/models/deepseek_v4/nvidia/flashmla.py`, lines 149-165
+文件：`vllm/models/deepseek_v4/nvidia/flashmla.py`，第 149-165 行
 
-When `attn_metadata is None` during CUDA graph warmup, the `forward_mqa` path pre-reserves the bf16 gather workspace:
+当 CUDA 图预热期间 `attn_metadata is None` 时，`forward_mqa` 路径会预保留 bf16 gather 工作空间：
 
 ```python
 if attn_metadata is None:
@@ -92,11 +92,11 @@ if attn_metadata is None:
     return
 ```
 
-This ensures the `workspace_manager` allocates the workspace with stable addresses that will be reused during graph replay. The dequantize/topk/sparse_fwd kernels are skipped during warmup since there is no real metadata.
+这确保了 `workspace_manager` 分配具有稳定地址的工作空间，该地址将在图重放期间被重用。由于没有真实的元数据，去量化/topk/sparse_fwd 内核在预热期间被跳过。
 
-## 5. Tile Scheduler Metadata (Graph-Aware Allocator)
+## 5. Tile 调度器元数据（图感知分配器）
 
-File: `vllm/models/deepseek_v4/nvidia/flashmla.py`, lines 262-284
+文件：`vllm/models/deepseek_v4/nvidia/flashmla.py`，第 262-284 行
 
 ```python
 if layer.compress_ratio <= 1:
@@ -107,35 +107,35 @@ elif layer.compress_ratio == 128:
     tile_metadata = swa_metadata.tile_sched_c128a
 ```
 
-The `tile_scheduler_metadata` is allocated via PyTorch's graph-aware allocator during metadata building (in `DeepseekSparseSWAMetadataBuilder.build_tile_scheduler`). This means:
+`tile_scheduler_metadata` 在元数据构建期间（在 `DeepseekSparseSWAMetadataBuilder.build_tile_scheduler` 中）通过 PyTorch 的图感知分配器分配。这意味着：
 
-- The first call per layer type triggers the in-kernel planner, which allocates `tile_scheduler_metadata` and `num_splits` tensors.
-- Subsequent same-type layers see `have_initialized=True` and skip the planner, reusing the same tensors.
-- During CUDA graph capture, these tensors have stable addresses, so the `flash_mla_with_kvcache` kernel arguments are graph-compatible.
+- 每层类型的第一次调用会触发内核内规划器，该规划器分配 `tile_scheduler_metadata` 和 `num_splits` 张量。
+- 后续相同类型的层看到 `have_initialized=True` 并跳过规划器，重用相同的张量。
+- 在 CUDA 图捕获期间，这些张量具有稳定的地址，因此 `flash_mla_with_kvcache` 内核参数是与图兼容的。
 
-Three separate tile scheduler metadata entries exist:
-| Entry | Layer Type |
+存在三个独立的 tile 调度器元数据条目：
+| 条目 | 层类型 |
 |---|---|
 | `tile_sched_swaonly` | `compress_ratio <= 1` |
 | `tile_sched_c4a` | `compress_ratio == 4` |
 | `tile_sched_c128a` | `compress_ratio == 128` |
 
-## 6. Opaque Custom CUDA Kernels
+## 6. 不透明的自定义 CUDA 内核
 
-The following kernels are opaque to `torch.compile` and are never traced:
+以下内核对于 `torch.compile` 是不透明的，永远不会被追踪：
 
-| Kernel | Location | Purpose |
+| 内核 | 位置 | 用途 |
 |---|---|---|
-| `flash_mla_with_kvcache` | `vllm.v1.attention.ops.flashmla` | Multi-head latent attention with KV cache (decode) |
-| `flash_mla_sparse_fwd` | `vllm.v1.attention.ops.flashmla` | Sparse MLA forward (prefill) |
-| MegaMoE experts | `vllm.models.deepseek_v4.nvidia.model` | Fused MoE expert computation |
-| `dequantize_and_gather_k_cache` | `vllm.models.deepseek_v4.common.ops` | FP8 dequant + KV gather |
+| `flash_mla_with_kvcache` | `vllm.v1.attention.ops.flashmla` | 带 KV 缓存的多头潜在注意力（解码） |
+| `flash_mla_sparse_fwd` | `vllm.v1.attention.ops.flashmla` | 稀疏 MLA 前向（预填充） |
+| MegaMoE experts | `vllm.models.deepseek_v4.nvidia.model` | 融合 MoE 专家计算 |
+| `dequantize_and_gather_k_cache` | `vllm.models.deepseek_v4.common.ops`（详见 [[DeepseekV4_KVCache_Ops#dequantize_and_gather_k_cache]]） | FP8 去量化 + KV gather |
 
-These are excluded from the `torch.compile` graph either via `no_compile_layers` or because they are custom CUDA/Triton kernels registered as PyTorch ops.
+这些内核要么通过 `no_compile_layers` 被排除在 `torch.compile` 图之外，要么因为它们是注册为 PyTorch 算子的自定义 CUDA/Triton 内核。
 
-## 7. ROCm: Copy Ragged to Graph Buffers
+## 7. ROCm：复制不规则数据到图缓冲区
 
-File: `vllm/models/deepseek_v4/amd/rocm.py`, lines 427-448
+文件：`vllm/models/deepseek_v4/amd/rocm.py`，第 427-448 行
 
 ```python
 def _copy_ragged_to_graph_buffers(
@@ -153,21 +153,21 @@ def _copy_ragged_to_graph_buffers(
     return ragged_out, indptr_out
 ```
 
-On ROCm, the dynamic ragged indices/indptr (from combining topk + SWA indices) must be copied into pre-allocated graph-stable buffers. This ensures CUDA graph replay sees the same tensor addresses every time. The buffers are sized to the maximum possible entries (`num_rows * max_entries_per_row`) and slicing keeps the storage address stable.
+在 ROCm 上，动态的不规则索引/indptr（来自组合 topk + SWA 索引）必须复制到预分配的图稳定缓冲区中。这确保了 CUDA 图重放每次看到相同的张量地址。缓冲区大小设置为最大可能条目数（`num_rows * max_entries_per_row`），切片操作保持存储地址稳定。
 
-## Summary: CUDA Graph Compatibility per Component
+## 总结：各组件的 CUDA 图兼容性
 
-| Component | Mechanism | Stable Addresses? |
+| 组件 | 机制 | 地址稳定？ |
 |---|---|---|
-| Q/KV/output tensors | Fixed max batch allocation, padded heads | Yes |
-| MegaMoE experts | `no_compile_layers` lookup by name | N/A (excluded from graph) |
-| Tile scheduler metadata | PyTorch graph-aware allocator | Yes |
-| bf16 gather workspace | `workspace_manager.get_simultaneous()` | Yes (pre-reserved during warmup) |
-| MTP hidden buffer | Pre-allocated outside graph pool | Yes |
-| Ragged indices (ROCm) | Pre-allocated buffers, `copy_` update | Yes |
-| `flash_mla_with_kvcache` | Custom CUDA kernel, opaque to compile | Yes (fixed args from graph) |
-| Topk indices buffer | Pre-allocated per layer (`topk_indices_buffer`) | Yes |
-| SWA indices | From metadata, backed by graph-aware storage | Yes |
-| Attention sink | `layer.attn_sink` (constant scalar or tensor) | Yes |
+| Q/KV/输出张量 | 固定最大批分配，填充头数 | 是 |
+| MegaMoE 专家 | 按名称的 `no_compile_layers` 查找 | 不适用（被排除在图外） |
+| Tile 调度器元数据 | PyTorch 图感知分配器 | 是 |
+| bf16 gather 工作空间 | `workspace_manager.get_simultaneous()` | 是（预热期间预保留） |
+| MTP 隐藏状态缓冲区 | 在图池外预分配 | 是 |
+| 不规则索引（ROCm） | 预分配缓冲区，`copy_` 更新 | 是 |
+| `flash_mla_with_kvcache` | 自定义 CUDA 内核，对编译不透明 | 是（来自图的固定参数） |
+| Topk 索引缓冲区 | 每层预分配（`topk_indices_buffer`） | 是 |
+| SWA 索引 | 来自元数据，由图感知存储支持 | 是 |
+| Attention sink | `layer.attn_sink`（常量标量或张量） | 是 |
 
-Related notes: [[V1AttentionBackend]], [[DeepseekV4ForCausalLM]], [[DeepseekV4MLAAttention]], [[DeepseekV4MoE]], [[NvidiaVsAMD]]
+相关笔记：[[V1AttentionBackend]], [[DeepseekV4ForCausalLM]], [[DeepseekV4MLAAttention]], [[DeepseekV4MoE]], [[NvidiaVsAMD]]

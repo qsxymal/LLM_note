@@ -1,26 +1,26 @@
 # V1AttentionBackend -- DeepseekV4FlashMLASparseBackend
 
-## File: `vllm/models/deepseek_v4/nvidia/flashmla.py`
+## 文件：`vllm/models/deepseek_v4/nvidia/flashmla.py`
 
-## Class Hierarchy
+## 类层次结构
 
 ```
 SparseMLAAttentionImpl[FlashMLASparseMetadata]   (vllm.v1.attention.backend)
   |
-  +-- DeepseekV4SparseMLAAttentionImpl   (abstract, line 37)
+  +-- DeepseekV4SparseMLAAttentionImpl   (抽象类, 第 37 行)
         |
-        +-- DeepseekV4FlashMLASparseImpl   (concrete, line 114)
+        +-- DeepseekV4FlashMLASparseImpl   (具体类, 第 114 行)
 
 FlashMLASparseBackend   (vllm.v1.attention.backends.mla.flashmla_sparse)
   |
-  +-- DeepseekV4FlashMLASparseBackend   (line 79)
+  +-- DeepseekV4FlashMLASparseBackend   (第 79 行)
 ```
 
-## DeepseekV4SparseMLAAttentionImpl (line 37-76)
+## DeepseekV4SparseMLAAttentionImpl（第 37-76 行）
 
-Abstract parent class that overrides the V1 framework's expected interface.
+覆盖 V1 框架期望接口的抽象父类。
 
-**Key design decision -- Liskov-broken override (line 40-44):**
+**关键设计决策 -- 违反里氏替换原则的覆写（第 40-44 行）：**
 
 ```python
 class DeepseekV4SparseMLAAttentionImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
@@ -31,32 +31,32 @@ class DeepseekV4SparseMLAAttentionImpl(SparseMLAAttentionImpl[FlashMLASparseMeta
     is never called on V4 layers."""
 ```
 
-In V1, `forward_mqa` is normally an instance method called by the framework. For V4, `DeepseekV4MLAAttention.forward` calls `cls.forward_mqa(layer, ...)` directly, making the framework's orchestration a no-op.
+在 V1 中，`forward_mqa` 通常是一个由框架调用的实例方法。对于 V4，`DeepseekV4MLAAttention.forward` 直接调用 `cls.forward_mqa(layer, ...)`，使得框架的编排成为空操作。
 
-**`PREFILL_CHUNK_SIZE = 4`** (line 52):
-- Prefill is processed in chunks of 4 sequences at a time.
-- This limits the bf16 gather workspace to `(4, M, head_dim)` bytes.
-- The same constant is read by `DeepseekV4MLAAttention`'s dummy-run path to pre-reserve workspace during CUDA graph warmup.
+**`PREFILL_CHUNK_SIZE = 4`**（第 52 行）：
+- Prefill 每次以 4 个序列为一块进行处理。
+- 这限制了 bf16 收集工作空间的大小为 `(4, M, head_dim)` 字节。
+- 同样的常量被 `DeepseekV4MLAAttention` 的 dummy-run 路径读取，用于在 CUDA 图预热期间预保留工作空间。
 
-**Abstract methods:**
-- `forward_mqa(cls, layer, q, kv, positions, output)` (line 54-64) -- classmethod, first arg is the layer, not self.
-- `get_padded_num_q_heads(cls, num_heads) -> int` (line 67-76) -- returns padded head count the wrapper should allocate q/output buffers at.
+**抽象方法：**
+- `forward_mqa(cls, layer, q, kv, positions, output)`（第 54-64 行）-- 类方法，第一个参数是层，不是 self。
+- `get_padded_num_q_heads(cls, num_heads) -> int`（第 67-76 行）-- 返回封装器应分配的 q/output 缓冲区的填充后头数。
 
-## DeepseekV4FlashMLASparseBackend (line 79-111)
+## DeepseekV4FlashMLASparseBackend（第 79-111 行）
 
-Extends `FlashMLASparseBackend` with V4-specific overrides:
+使用 V4 特定覆写扩展 `FlashMLASparseBackend`：
 
-| Method | Return Value | Notes |
+| 方法 | 返回值 | 备注 |
 |---|---|---|
-| `get_supported_kernel_block_sizes()` | `[256]` | Single fixed block size |
-| `get_name()` | `"V4_FLASHMLA_SPARSE"` | Backend identifier |
-| `get_impl_cls()` | `DeepseekV4FlashMLASparseImpl` | Concrete impl class |
-| `get_supported_head_sizes()` | `[512]` | V4 layout: 448 NoPE + 64 RoPE (overrides V3.2 default of 576) |
-| `get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str)` | `(num_blocks, block_size, 584)` when `cache_dtype_str=="fp8_ds_mla"` | 584 = 448 NoPE + 128 RoPE + 8 fp8 scale |
+| `get_supported_kernel_block_sizes()` | `[256]` | 单个固定块大小 |
+| `get_name()` | `"V4_FLASHMLA_SPARSE"` | 后端标识符 |
+| `get_impl_cls()` | `DeepseekV4FlashMLASparseImpl` | 具体实现类 |
+| `get_supported_head_sizes()` | `[512]` | V4 布局：448 NoPE + 64 RoPE（覆盖 V3.2 默认的 576） |
+| `get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str)` | `(num_blocks, block_size, 584)` 当 `cache_dtype_str=="fp8_ds_mla"` 时 | 584 = 448 NoPE + 128 RoPE + 8 fp8 缩放 |
 
-## DeepseekV4FlashMLASparseImpl (line 114-425)
+## DeepseekV4FlashMLASparseImpl（第 114-425 行）
 
-### Head Padding (line 119-127)
+### 头填充（第 119-127 行）
 
 ```python
 @classmethod
@@ -65,84 +65,84 @@ def get_padded_num_q_heads(cls, num_heads: int) -> int:
     return 64 if num_heads <= 64 else 128
 ```
 
-The FP8 decode kernel (`flash_mla_with_kvcache` with FP8 KV cache) requires the Q head dimension to be exactly 64 or 128. The MLA wrapper allocates q/output at `[N, padded_heads, head_dim]`.
+FP8 解码内核（`flash_mla_with_kvcache` 配合 FP8 KV 缓存）要求 Q 头维度恰好为 64 或 128。MLA 封装器在 `[N, padded_heads, head_dim]` 处分配 q/output。
 
-### Forward Dispatch (line 129-208)
+### 前向分发（第 129-208 行）
 
-`forward_mqa` splits into decode and prefill paths:
+`forward_mqa` 拆分为解码和 prefill 路径：
 
 ```
 forward_mqa()
-  |-- attn_metadata is None  -> warmup dummy run (line 149-165)
-  |-- num_prefills > 0       -> _forward_prefill() (line 188-198)
-  |-- num_decodes > 0        -> _forward_decode() (line 199-208)
+  |-- attn_metadata is None  -> 预热 dummy 运行（第 149-165 行）
+  |-- num_prefills > 0       -> _forward_prefill()（第 188-198 行）
+  |-- num_decodes > 0        -> _forward_decode()（第 199-208 行）
 ```
 
-**Warmup path** (lines 149-165): When `attn_metadata is None`, reserves the bf16 gather workspace via `current_workspace_manager().get_simultaneous()` and zeroes output. The dequantize/topk/sparse_fwd kernels are skipped. This is the CUDA graph warmup hook.
+**预热路径**（第 149-165 行）：当 `attn_metadata is None` 时，通过 `current_workspace_manager().get_simultaneous()` 预留 bf16 收集工作空间并将输出置零。反量化/topk/sparse_fwd 内核被跳过。这是 CUDA 图预热钩子。
 
-- `swa_only` is determined by `layer.compress_ratio <= 1`.
-- `N` = `(max_model_len + compress_ratio - 1) // compress_ratio` (size of compressed KV pool).
-- `M` = `N + window_size + max_num_batched_tokens`.
+- `swa_only` 由 `layer.compress_ratio <= 1` 确定。
+- `N` = `(max_model_len + compress_ratio - 1) // compress_ratio`（压缩 KV 池的大小）。
+- `M` = `N + window_size + max_num_batched_tokens`。
 
-### Decode Path (line 210-302)
+### 解码路径（第 210-302 行）
 
 ```
 _forward_decode()
-  |-- Determine topk_indices/topk_lens:
-  |     compress_ratio == 4  (C4A)  -> compute_global_topk_indices_and_lens() (line 234)
-  |     compress_ratio == 128 (C128A) -> pre-computed in metadata (line 244)
-  |-- SWA indices from swa_metadata.decode_swa_indices / decode_swa_lens
+  |-- 确定 topk_indices/topk_lens：
+  |     compress_ratio == 4  (C4A)  -> [[DeepseekV4_KVCache_Ops#compute_global_topk_indices_and_lens|compute_global_topk_indices_and_lens]]()（第 234 行）
+  |     compress_ratio == 128 (C128A) -> 在元数据中预计算（第 244 行）
+  |-- SWA 索引来自 swa_metadata.decode_swa_indices / decode_swa_lens
   |-- q.unsqueeze(1)  -> (num_decode_tokens, 1, 1, head_dim)
   |-- swa_cache = swa_cache_layer.kv_cache.unsqueeze(-2)
-  |-- kv_cache = kv_cache.unsqueeze(-2) if not swa_only
-  |-- Select tile_scheduler_metadata per layer type (line 268-284):
+  |-- kv_cache = kv_cache.unsqueeze(-2)（如果不是仅 SWA）
+  |-- 按层类型选择 tile_scheduler_metadata（第 268-284 行）：
   |     compress_ratio <= 1   -> tile_sched_swaonly
   |     compress_ratio == 4    -> tile_sched_c4a
   |     compress_ratio == 128  -> tile_sched_c128a
-  |-- flash_mla_with_kvcache()  (line 286-302)
+  |-- flash_mla_with_kvcache()（第 286-302 行）
 ```
 
-**Tile scheduler metadata** (lines 262-284): One metadata entry per layer type (SWA-only / C4A / C128A), shared across all same-type layers within a decode step. On the first call per type, the in-kernel planner runs (allocating `tile_scheduler_metadata` and `num_splits` via PyTorch's graph-aware allocator). Subsequent same-type layers see `have_initialized=True` on the metadata and skip the planner.
+**Tile 调度器元数据**（第 262-284 行）：每种层类型（仅 SWA / C4A / C128A）一个元数据条目，在一个解码步骤中所有同类型层共享。在首次调用每种类型时，内核内规划器运行（通过 PyTorch 的图感知分配器分配 `tile_scheduler_metadata` 和 `num_splits`）。后续的同类型层看到元数据上的 `have_initialized=True` 并跳过规划器。
 
-This is critical for CUDA graph capture -- the kernel arguments must live at stable addresses across graph replays.
+这对 CUDA 图捕获至关重要——内核参数必须在图重放期间驻留在稳定的地址上。
 
-**C4A topk indices** (lines 231-241): Local indices differ per layer, filled by the Indexer. Global indices are computed on the fly. **C128A topk indices** (lines 243-244): Pre-computed during metadata build, stored in `attn_metadata.c128a_global_decode_topk_indices`.
+**C4A topk 索引**（第 231-241 行）：局部索引每层不同，由 Indexer 填充。全局索引即时计算。**C128A topk 索引**（第 243-244 行）：在元数据构建期间预计算，存储在 `attn_metadata.c128a_global_decode_topk_indices`。
 
-### Prefill Path (lines 304-424)
+### Prefill 路径（第 304-424 行）
 
 ```
 _forward_prefill()
-  |-- Derive prefill-local token offsets from query_start_loc_cpu (line 335)
-  |-- For non-SWA-only layers:
+  |-- 从 query_start_loc_cpu 派生 prefill 局部的 token 偏移（第 335 行）
+  |-- 对于非仅 SWA 层：
   |     C4A   -> topk_indices = layer.topk_indices_buffer[num_decode_tokens:]
   |     C128A -> attn_metadata.c128a_prefill_topk_indices
-  |-- Compute N, M (same as warmup)
-  |-- For each chunk of PREFILL_CHUNK_SIZE (4) sequences (line 360-424):
-  |     |-- Workspace: get_simultaneous((chunk_size, M, head_dim), bf16)
-  |     |-- Dequantize & gather compressed KV cache (line 373-381)
-  |     |-- Dequantize & gather SWA KV cache (line 385-393)
-  |     |-- Combine topk + SWA indices (line 403-415)
-  |     |-- flash_mla_sparse_fwd() (line 416-424)
+  |-- 计算 N, M（与预热相同）
+  |-- 对于每个 PREFILL_CHUNK_SIZE（4）序列的块（第 360-424 行）：
+  |     |-- 工作空间：get_simultaneous((chunk_size, M, head_dim), bf16)
+  |     |-- 反量化并收集压缩的 KV 缓存（第 373-381 行）
+  |     |-- 反量化并收集 SWA KV 缓存（第 385-393 行）
+  |     |-- 合并 topk + SWA 索引（第 403-415 行）
+  |     |-- flash_mla_sparse_fwd()（第 416-424 行）
 ```
 
-### KV Cache Shapes
+### KV 缓存形状
 
-| Cache | Shape | Description |
+| 缓存 | 形状 | 描述 |
 |---|---|---|
-| Main MLA KV cache | `(num_blocks, block_size, 584)` | 448 NoPE + 128 RoPE + 8 fp8 scale bytes |
-| SWA KV cache | `(num_blocks, swa_block_size, head_dim)` | Sliding window attention cache |
-| Compressed KV cache | Per-layer, `compress_ratio` buckets | Top-k compressed key-value pool |
+| 主 MLA KV 缓存 | `(num_blocks, block_size, 584)` | 448 NoPE + 128 RoPE + 8 fp8 缩放字节 |
+| SWA KV 缓存 | `(num_blocks, swa_block_size, head_dim)` | 滑动窗口注意力缓存 |
+| 压缩 KV 缓存 | 每层，`compress_ratio` 桶 | Top-k 压缩键值池 |
 
-## Metadata Types
+## 元数据类型
 
 ```python
-FlashMLASparseMetadata    # from vllm.v1.attention.backends.mla.flashmla_sparse
+FlashMLASparseMetadata    # 来自 vllm.v1.attention.backends.mla.flashmla_sparse
   - block_table, block_size
   - c128a_global_decode_topk_indices
   - c128a_decode_topk_lens
   - c128a_prefill_topk_indices
 
-DeepseekSparseSWAMetadata # from vllm.v1.attention.backends.mla.sparse_swa
+DeepseekSparseSWAMetadata # 来自 vllm.v1.attention.backends.mla.sparse_swa
   - num_decodes, num_decode_tokens
   - num_prefills, num_prefill_tokens
   - decode_swa_indices, decode_swa_lens
@@ -153,16 +153,16 @@ DeepseekSparseSWAMetadata # from vllm.v1.attention.backends.mla.sparse_swa
   - is_valid_token
 ```
 
-## Attention Flow: Who Calls Whom
+## 注意力流程：调用关系
 
 ```
 DeepseekV4Model.forward()
   -> DeepseekV4DecoderLayer.forward()
-    -> DeepseekV4MLAAttention.forward()      # drives attention, not the V1 framework
+    -> DeepseekV4MLAAttention.forward()      # 驱动注意力，而不是 V1 框架
       -> attn_fn = attn_backend.get_impl_cls().forward_mqa
       = DeepseekV4FlashMLASparseImpl.forward_mqa(layer, q, kv, positions, output)
 ```
 
-The V1 framework provides metadata (block_table, seq_lens, tile_scheduler_metadata through metadata builders), but `DeepseekV4MLAAttention.forward` orchestrates the call, not the V1 attention runner.
+V1 框架提供元数据（block_table、seq_lens、tile_scheduler_metadata 通过元数据构建器），但 `DeepseekV4MLAAttention.forward` 负责编排调用，而不是 V1 注意力运行器。
 
-Related notes: [[DeepseekV4MLAAttention]], [[DeepseekV4FlashMLASparseImpl]], [[CUDAGraphIntegration]], [[DeepseekV4Attention]]
+相关笔记：[[DeepseekV4MLAAttention]], [[DeepseekV4FlashMLASparseImpl]], [[CUDAGraphIntegration]], [[DeepseekV4Attention]]

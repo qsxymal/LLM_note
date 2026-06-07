@@ -54,8 +54,10 @@ def get_quant_method(self, layer, prefix):
 每个 token 的 KV 在缓存中占 584 字节：
   ┌─────────────────┬─────────────────┬──────┐
   │ NoPE (448B)     │ RoPE (128B)     │ meta │
-  │ FP8 E4M3        │ FP8 E4M3        │ 8B   │
+  │ FP8 E4M3        │ BF16            │ 8B   │
   └─────────────────┴─────────────────┴──────┘
+
+> **注意**：RoPE 部分不做量化，以 BF16 格式直接存储。64 个 RoPE 元素 × 2 字节(BF16) = 128 字节。缩放因子 8 字节中 7 个为 UE8M0（7 个 FP8 量化块的缩放），第 8 个为 padding。
 ```
 
 - 由 `FlashMLASparseBackend.get_kv_cache_shape()` 定义（`attention.py?`），block_size=256 时每块大小 `256 × 584`。

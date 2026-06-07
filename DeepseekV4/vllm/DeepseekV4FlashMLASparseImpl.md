@@ -190,7 +190,7 @@ if not swa_only:
     is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
     if layer.compress_ratio == 4:
         # C4A: local indices per layer (filled by Indexer)
-        global_indices, topk_lens = compute_global_topk_indices_and_lens(
+        global_indices, topk_lens = [[DeepseekV4_KVCache_Ops#compute_global_topk_indices_and_lens|compute_global_topk_indices_and_lens]](
             layer.topk_indices_buffer[:num_decode_tokens],
             swa_metadata.token_to_req_indices,
             attn_metadata.block_table[:num_decodes],
@@ -369,11 +369,7 @@ for chunk_idx in range(num_chunks):
 
 ```python
 if not swa_only:
-    dequantize_and_gather_k_cache(
-        kv[:chunk_size],
-        compressed_k_cache,
-        seq_lens=seq_lens[chunk_start:chunk_end] // layer.compress_ratio,
-        gather_lens=None,
+    [[DeepseekV4_KVCache_Ops#dequantize_and_gather_k_cache|dequantize_and_gather_k_cache]](
         block_table=block_table[chunk_start:chunk_end],
         block_size=attn_metadata.block_size // layer.compress_ratio,
         offset=0,
@@ -403,7 +399,7 @@ dequantize_and_gather_k_cache(
 #### 3. 组合索引（topk + SWA）
 
 ```python
-combined_indices, combined_lens = combine_topk_swa_indices(
+combined_indices, combined_lens = [[DeepseekV4_KVCache_Ops#combine_topk_swa_indices|combine_topk_swa_indices]](
     topk_indices[query_start:query_end],
     query_start_loc[num_decodes + chunk_start : num_decodes + chunk_end + 1],
     seq_lens[chunk_start:chunk_end],
@@ -573,7 +569,7 @@ for chunk_idx in range(num_chunks):
     )
 
     # L403-415: 合并 topk 索引和 SWA 索引
-    combined_indices, combined_lens = combine_topk_swa_indices(
+    combined_indices, combined_lens = [[DeepseekV4_KVCache_Ops#combine_topk_swa_indices|combine_topk_swa_indices]](
         topk_indices[query_start:query_end],
         query_start_loc[num_decodes + chunk_start : num_decodes + chunk_end + 1],
         seq_lens[chunk_start:chunk_end],

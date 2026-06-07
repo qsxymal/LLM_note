@@ -1,18 +1,22 @@
 # common/ops -- 跨平台融合操作算子
 
+**文件路径：** `vllm/models/deepseek_v4/common/ops/`
+**导出函数（`__init__.py`，共 8 个）：** `fused_q_kv_rmsnorm`、`fused_inv_rope_fp8_quant`、`fused_indexer_q_rope_quant`、`save_partial_states`、`dequantize_and_gather_k_cache`、`quantize_and_insert_k_cache`、`compute_global_topk_indices_and_lens`、`combine_topk_swa_indices`
+
 ## 概览
 
-`vllm/models/deepseek_v4/common/ops/` 目录包含跨平台（NVIDIA + AMD）共享的 Triton 算子。
-通过 `__init__.py` 导出 8 个函数，供 NVIDIA 和 AMD 两端的注意力/压缩逻辑消费。
+该目录包含跨平台（NVIDIA + AMD）共享的 Triton 算子，供两端的注意力/压缩逻辑消费。
 
-当前目录下的文件：
+目录中的文件与对应笔记：
 
-- `cache_utils.py` -- KV cache 量化/去量化与全局 top-k 索引
-- `fused_compress_quant_cache.py`
-- `fused_indexer_q.py` -- 带 RoPE + 量化 (MXFP4) 的索引器 Q 融合
-- `fused_inv_rope_fp8_quant.py` -- 逆 RoPE + FP8 量化融合
-- `fused_qk_rmsnorm.py` -- Q 和 KV 的 RMSNorm 融合 kernel（本笔记）
-- `save_partial_states.py` -- 向压缩器状态缓存写入 partial states（本笔记）
+| 文件 | 对应笔记 | 说明 |
+|------|---------|------|
+| `fused_qk_rmsnorm.py` | 本文档 | Q 和 KV 的 RMSNorm 融合 kernel |
+| `save_partial_states.py` | 本文档 | 向压缩器状态缓存写入 partial states |
+| `fused_inv_rope_fp8_quant.py` | [[FusedInvRopeFP8Quant]] | 逆 RoPE + FP8 量化融合 |
+| `fused_indexer_q.py` | [[FusedIndexerQ]] | 带 RoPE + 量化 (MXFP4) 的索引器 Q 融合 |
+| `fused_compress_quant_cache.py` | [[DeepseekV4_KVCache_Ops#FusedCompressQuantCache]] | 压缩器 → Norm → RoPE → 量化 → 缓存插入 |
+| `cache_utils.py` | [[DeepseekV4_KVCache_Ops#CacheUtils]] | KV cache 量化/去量化与全局 top-k 索引 |
 
 ---
 
@@ -163,3 +167,14 @@ store(base_ptr + STATE_WIDTH + block, score + ape, mask)
 
 - **Padding tokens（第 71-76 行）：** `slot_id < 0` 时跳过——这是保护 CUDA graph batch 中无效 slot 的唯一手段。
 - **APE 索引越界保护：** `position % COMPRESS_RATIO` 保证 `ape_row` 永远落在 `[0, COMPRESS_RATIO)` 范围内。
+
+---
+
+## 相关笔记
+
+- [[FusedInvRopeFP8Quant]] — 同目录下的逆 RoPE + FP8 量化融合算子
+- [[FusedIndexerQ]] — 同目录下的 Indexer Q 正向 RoPE + 量化融合算子（含 nvidia/ops CuteDSL 备选）
+- [[DeepseekV4_KVCache_Ops]] — 同目录下的 KV Cache 量化/压缩算子族
+- [[DequantGatherKCache]] — `nvidia/ops/` 下的 FP8 K 缓存反量化 + 聚集 CuteDSL 内核
+- [[SparseAttnCompress]] — `nvidia/ops/` 下的稀疏注意力 KV 压缩 CuteDSL 内核族
+- [[PrepareMegaMoEInputs]] — `nvidia/ops/` 下的 MegaMoE 输入 FP8 量化 Triton 内核

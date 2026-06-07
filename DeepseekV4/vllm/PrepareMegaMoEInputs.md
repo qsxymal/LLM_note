@@ -1,6 +1,7 @@
 # prepare_megamoe_inputs —— MegaMoE 输入 FP8 量化 Triton 内核
 
 **文件路径：** `vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py`
+**所属模块族：** `nvidia/ops/` — NVIDIA SM100 算力族
 **内核函数：** `_prepare_megamoe_inputs_kernel`（`L15-L115`，Triton JIT）
 **Host 封装：** `prepare_megamoe_inputs`（`L118-L173`）
 
@@ -148,8 +149,9 @@ deep_gemm.fp8_fp4_mega_moe (DeepGEMM kernel)
 - **`top_k` 非 2 的幂**（L144）：`triton.next_power_of_2(top_k)` 自动填充，Triton 的 mask 机制保证超出的位置不会影响计算。
 - **极小的激活值**（L58）：`amax = max(amax, 1e-4)` 避免除以 0 导致的无穷大缩放因子。
 
-## Cross-References
+## 相关笔记
 
+- [[SparseAttnCompress]]：同 `nvidia/ops/` 目录的另一 Triton/CuteDSL 内核，共享 FP8 量化模式
 - [[DeepseekV4MoE]]：MegaMoE 路径的整体流程和 `_run_mega_moe` 的调用链
 - [[DeepseekV4MegaMoEExperts]]：`get_symm_buffer` 和 `finalize_weights` 的配套逻辑
 - [[QuantAndParallelStrategy]]：MegaMoE 路径的量化策略（FP4 权重 + FP8 激活）

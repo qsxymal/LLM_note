@@ -167,7 +167,7 @@ if current_platform.is_rocm():
 ### 3.2 CUDA 优化路径：逆 RoPE + FP8 量化 + FP8 Einsum + wo_b
 
 ```python
-o_fp8, o_scale = fused_inv_rope_fp8_quant(
+o_fp8, o_scale = [[FusedInvRopeFP8Quant|fused_inv_rope_fp8_quant]](
     o,
     positions,
     self.rotary_emb.cos_sin_cache,
@@ -279,10 +279,10 @@ def attention_impl(self, hidden_states, positions, out):
 
 ```python
 qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-qr, kv = fused_q_kv_rmsnorm(qr, kv, self.q_norm.weight.data, self.kv_norm.weight.data, self.eps)
+qr, kv = [[common_ops#fused_q_kv_rmsnorm|fused_q_kv_rmsnorm]](qr, kv, self.q_norm.weight.data, self.kv_norm.weight.data, self.eps)
 ```
 
-- `fused_q_kv_rmsnorm` 是一个融合内核，同时计算两个 RMSNorm。
+- [[common_ops#fused_q_kv_rmsnorm|`fused_q_kv_rmsnorm`]] 是一个融合内核，同时计算两个 RMSNorm。
 
 - `attention.py:422` 的 `qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)` 将 `fused_wqa_wkv` 的输出在最后一维拆分为两部分：
   - `qr`（形状 `[num_tokens, q_lora_rank]`，通常 1536）：低秩 Q 表示。后续通过 `wq_b` 线性映射回 `n_local_heads * head_dim` 的完整 Q 空间。
@@ -400,8 +400,8 @@ self.mla_attn(q, kv, positions, output=out)
    - 使用 CUDA 事件进行细粒度同步，并且可通过 `VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD` 环境变量控制小 batch 退化为串行。  
 
 4. **内核融合**  
-   - `fused_q_kv_rmsnorm`：同时计算 Q 和 K/V 的 RMSNorm  
-   - `fused_inv_rope_fp8_quant`：逆 RoPE + FP8 量化  
+   - [[common_ops#fused_q_kv_rmsnorm|`fused_q_kv_rmsnorm`]]：同时计算 Q 和 K/V 的 RMSNorm  
+   - [[FusedInvRopeFP8Quant|`fused_inv_rope_fp8_quant`]]：逆 RoPE + FP8 量化  
    - `fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`：Q 的 per‑head norm + RoPE + 填充，KV 的 RoPE + FP8 量化 + 缓存插入  
    - 这些融合减少内核启动和内存读写，与流重叠相辅相成。
 

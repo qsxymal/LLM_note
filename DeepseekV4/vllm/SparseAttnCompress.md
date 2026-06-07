@@ -2,6 +2,7 @@
 
 **文件路径：** `vllm/models/deepseek_v4/nvidia/ops/sparse_attn_compress_cutedsl.py`
 **公开函数：** `compress_norm_rope_store_cutedsl`（`L1244-L1332`）— 统一入口
+**所属模块族：** `nvidia/ops/` — NVIDIA SM100 CuteDSL 算子族
 
 ## 1. 模块定位
 
@@ -119,9 +120,12 @@ def compress_norm_rope_store_cutedsl(...):
   [576..583]  E8M0 scales (8 字节, 每 64 元素一个)
 ```
 
-## Cross-References
+## 相关笔记
 
+- [[DequantGatherKCache]]：同 `nvidia/ops/` 目录的另一 CuteDSL 内核，共享 FP8 缓存布局
 - [[DeepseekV4Indexer]]：Indexer 中触发 KV 压缩的调用点
 - [[DeepseekCompressor]]：Compressor 模块负责 KV 压缩和缓存管理
 - [[QuantAndParallelStrategy]]：FP8 KV 缓存布局（584 字节/token）
 - [[PrepareMegaMoEInputs]]：类似的 FP8 量化 + E8M0 scale 打包逻辑（Triton 实现）
+- [[DeepseekV4_KVCache_Ops#FusedCompressQuantCache]]：Triton 实现版本（功能等价，与 CuteDSL 互为备选）
+- [[FusedInvRopeFP8Quant]]：同 `common/ops/` 的 FP8 量化融合算子，共享 UE8M0 算法

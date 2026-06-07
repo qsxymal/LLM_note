@@ -82,7 +82,8 @@
 - `rotate=True` 表示压缩器内部会对 K 进行旋转变换，类似于 RoPE，增强位置敏感性。
 
 #### 4. 稀疏注意力算子 `SparseAttnIndexer`
-- 这是真正的索引器核心算法：输入 Q（已量化）、K（从 cache 中取）、weights（每头的标量权重），输出稀疏注意力结果（通常是 top-k 索引及对应的 attention score）。
+- 这是真正的索引器核心算法：输入 Q（已量化）、K（从 cache 中取）、weights（`(T, H)` float32 张量，FP8 路径下 Q 的 per-token 量化缩放因子已折叠入 weights），输出稀疏注意力结果（通常是 top-k 索引及对应的 attention score）。
+- **weight-fold 设计**：FP8 路径中 `FusedIndexerQ` 将 `q_scale` 乘入 `weights_out`，使得 `fp8_fp4_mqa_logits` 内核无需额外加载和乘以 Q 缩放因子。MXFP4 路径中 `q_scale` 以独立张量传递（无法折叠，因 per-block 粒度的缩放因子无法合并为单标量）。详见 [[FusedIndexerQ#2. 权重折叠设计原理]]。
 - 参数 `max_model_len` 与 `max_total_seq_len` 均除以 `compress_ratio`，因为压缩后序列长度缩短了。
 - `topk_indices_buffer` 是预先分配的缓冲区，用于存放选出的 token 索引，避免每次重新分配。
 
@@ -91,7 +92,7 @@
 - 原因：索引器本身计算量小，且输出结果（稀疏索引）需要在所有 GPU 上一致，复制的通信开销远小于张量并行引入的 all-gather 开销。
 
 #### 6. 位置编码与 RoPE
-- 索引器的 Q 需要应用 RoPE，但注意只有 `qk_rope_head_dim=64` 维度进行旋转，其余维度（`head_dim - rope_dim = 64`）不旋转。这在 `fused_indexer_q_rope_quant` 内核中完成。
+- 索引器的 Q 需要应用 RoPE，但注意只有 `qk_rope_head_dim=64` 维度进行旋转，其余维度（`head_dim - rope_dim = 64`）不旋转。这在 [[FusedIndexerQ|`fused_indexer_q_rope_quant`]] 内核中完成。
 - `rotary_emb.cos_sin_cache` 作为预先计算的三角函数表传入。
 
 #### 7. 与 vLLM 调度器的集成
