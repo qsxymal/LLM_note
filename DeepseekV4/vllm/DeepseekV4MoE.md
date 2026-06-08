@@ -285,6 +285,8 @@ topk_weights, topk_ids = fused_topk_bias(
 
 ## 8. 量化策略（MoE 相关）
 
+> 详细的数据类型、Scale 格式、量化公式等参见 [[MoEQuantization]]。
+
 ### 8.1 MegaMoE 路径的量化
 
 **三层量化管道：**
@@ -351,6 +353,7 @@ self.experts_start_idx = self.tp_rank * self.n_local_experts
 - 每个 TP rank 持有 `n_routed_experts / tp_size` 个完整专家。
 - FusedMoE 层内部通过 all-reduce 合并各专家的输出。
 - gate 路由网络是复制层（`ReplicatedLinear`），每个 rank 独立计算完整路由。
+- **AMD 路径仅支持 FusedMoE**：`amd/model.py` 中没有 `use_mega_moe` 标志，始终使用 FusedMoE + TP。AMD 不实现 MegaMoE，因为其依赖的 DeepGEMM 内核（含 EP all-to-all）是 NVIDIA SM100 专有的。
 
 ### 9.3 共享专家 — TP 策略
 
@@ -558,18 +561,68 @@ if success:
 
 ---
 
-## 15. 下一步分析建议
+## 15. AMD MoE 差异
+
+AMD 平台在 `amd/model.py` 中提供独立的 `DeepseekV4MoE` 实现（L110-L226），与 NVIDIA 版本相比有以下关键差异：
+
+### 15.1 无 MegaMoE 路径
+
+```python
+# amd/model.py L110 — 无 use_mega_moe 判断，直接使用 FusedMoE
+self.experts = FusedMoE(
+    gate=self.gate,
+    num_experts=config.n_routed_experts,
+    top_k=config.num_experts_per_tok,
+    ...
+)
+```
+
+| 特性 | NVIDIA | AMD |
+|------|--------|-----|
+| MegaMoE 支持 | ✓（SM100 Blackwell 专用） | ✗ |
+| 专家并行（EP） | ✓（MegaMoE 强制） | ✗（仅 TP） |
+| 专家精度 | FP4（MegaMoE）/ FP4/FP8/BF16（FusedMoE） | FP4/FP8/BF16（取决于 quant_config） |
+| FP8 激活量化 | ✓（`prepare_megamoe_inputs`） | ✗（无输入量化步骤） |
+| 对称缓冲区 | ✓（`symm_buffer` 管理） | ✗ |
+
+### 15.2 简化的架构
+
+- **gate 不再需要 `fused_topk_bias` 的独立调用**：AMD 将 gate 和 scoring_func 直接传入 `FusedMoE`，路由在 FusedMoE 内部通过 `is_internal_router` 机制完成（`amd/model.py:L186-202`）。
+- **无 `finalize_weights`**：AMD 路径不需要 DeepGEMM 布局转换，权重直接加载使用。
+- **`hash_indices_dtype` 为 `int32`**（而非 NVIDIA MegaMoE 的 `int64`），因为标准 FusedMoE 期望 `int32` 索引（`amd/model.py:L144`）。
+
+### 15.3 共享专家配置
+
+```python
+self.shared_experts = DeepseekV4MLP(
+    ...
+    reduce_results=False,  # AMD 路径：不额外 all-reduce
+)
+```
+
+`reduce_results=False` 与 NVIDIA FusedMoE 路径的 `reduce_results=self.use_mega_moe`（MegaMoE=True 时不 reduce）形成对比。在 AMD 上，共享专家始终交给 FusedMoE 内部的通信逻辑处理。
+
+### 15.4 整体区别
+
+AMD 的 MoE 实现本质上是**纯 FusedMoE 路径**，没有 MegaMoE 特有的 FP4 权重变换、EP all-to-all 通信和 FP8 激活量化。这意味着 AMD 的推理路径更简单，但也失去了 Blackwell GPU 上 FP4+EP 带来的极致性能。
+
+---
+
+## 16. 下一步分析建议
 
 - **DeepGEMM 内核分析**：`deep_gemm.fp8_fp4_mega_moe` 的 CUDA 内核实现和 all-to-all 通信模式
 - **与 V3/V3.2 MoE 的对比**：DeepSeek V3 的 MoE 实现与 V4 的差异（尤其是 FP4 支持）
 - **EP vs TP 的性能对比**：在 DeepSeek V4 规模下 EP 替代 TP 带来的通信收益量化
-- **Hash MoE 的 effect**：前 `num_hash_layers` 层的 hash 路由对负载均衡的影响
+- **Hash MoE 的效果**：前 `num_hash_layers` 层的 hash 路由对负载均衡的影响
+- **FP8 激活量化路径对比**：MegaMoE 的 `prepare_megamoe_inputs`（Triton）与标准 FusedMoE 的量化路径差异
 
 ---
 
 ## 相关笔记
 
 - [[PrepareMegaMoEInputs]] — `nvidia/ops/` 下的 MegaMoE 输入 FP8 量化 Triton 内核
+- [[MoEQuantization]] — 激活与权重量化完整详解（数据类型、Scale 格式、量化公式）
 - [[DeepseekV4FP8Config]] — 量化配置分发，控制 `expert_dtype`（FP4 vs FP8）
 - [[GateRouting]] — 门控路由数学：sqrtsoftplus、Hash MoE、Noaux TC
 - [[QuantAndParallelStrategy]] — MoE 路径的量化与并行策略
+- [[ROCmBackend]] — AMD ROCm 平台的注意力后端（不含 MegaMoE）

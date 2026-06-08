@@ -218,7 +218,7 @@ forward_prefill (分块，chunk_size=4)
 
 ## 两种 `combine_topk_swa_indices` 变体
 
-### 共享/通用版本（`common/ops/cache_utils.py`，详见 [[DeepseekV4_KVCache_Ops#combine_topk_swa_indices]]）
+### 共享/通用版本（`common/ops/cache_utils.py`，详见 [[DeepseekV4_KVCache_Ops#CacheUtils]]）
 
 被 NVIDIA prefill 使用，也可供通用使用。输出**稠密填充**的合并索引。
 

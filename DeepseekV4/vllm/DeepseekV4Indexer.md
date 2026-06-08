@@ -92,7 +92,7 @@
 - 原因：索引器本身计算量小，且输出结果（稀疏索引）需要在所有 GPU 上一致，复制的通信开销远小于张量并行引入的 all-gather 开销。
 
 #### 6. 位置编码与 RoPE
-- 索引器的 Q 需要应用 RoPE，但注意只有 `qk_rope_head_dim=64` 维度进行旋转，其余维度（`head_dim - rope_dim = 64`）不旋转。这在 [[FusedIndexerQ|`fused_indexer_q_rope_quant`]] 内核中完成。
+- 索引器的 Q 需要应用 RoPE，但注意只有 `qk_rope_head_dim=64` 维度进行旋转，其余维度（`head_dim - rope_dim = 64`）不旋转。这在 [[FusedIndexerQ|fused_indexer_q_rope_quant]] 内核中完成。
 - `rotary_emb.cos_sin_cache` 作为预先计算的三角函数表传入。
 
 #### 7. 与 vLLM 调度器的集成

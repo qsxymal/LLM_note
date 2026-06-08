@@ -16,6 +16,8 @@
 | MoE 输入激活（MegaMoE） | FP8 E4M3 | E8M0，block_size=128 | DeepGEMM 输入准备 | `prepare_megamoe_inputs` (Triton kernel) |
 | 注意力输出到 wo_a | FP8（UE8M0 动态） | group_shape=(1,128) | O 投影计算 | `DeepseekV4MultiHeadLatentAttentionWrapper`（`nvidia/model.py:L54`） |
 
+> MoE 相关的详细量化数据格式见 [[MoEQuantization]]。
+
 ### 1.2 整体混合精度
 
 ```

@@ -149,6 +149,29 @@ deep_gemm.fp8_fp4_mega_moe (DeepGEMM kernel)
 - **`top_k` 非 2 的幂**（L144）：`triton.next_power_of_2(top_k)` 自动填充，Triton 的 mask 机制保证超出的位置不会影响计算。
 - **极小的激活值**（L58）：`amax = max(amax, 1e-4)` 避免除以 0 导致的无穷大缩放因子。
 
+## 7. 关于 `nvidia/ops/__init__.py` 的设计说明
+
+`nvidia/ops/__init__.py` 是有意为空（不导出任何符号）的。这是 NVIDIA 特有算子族（CuteDSL 和 Triton实现）的入口模块。其设计原因如下：
+
+### 空 `__init__` 的原因
+
+```python
+# nvidia/ops/__init__.py (完整内容)
+"""NVIDIA-only (cutedsl/cutlass) kernels for DeepSeek V4.
+These modules import ``cutlass``/``cutedsl`` at module top level, so they must
+not be imported on non-CUDA platforms. Callers should gate on
+``vllm.utils.import_utils.has_cutedsl()`` before importing from here.
+This ``__init__`` deliberately imports nothing: re-exporting the cutedsl
+modules here would eagerly ``import cutlass`` (initializing the CUDA driver) for
+anyone who imports ``vllm.models.deepseek_v4``, breaking forked subprocesses.
+"""
+```
+
+**关键设计决策：**
+1. **延迟 CuteDSL 导入**：`import cutlass` 会初始化 CUDA 驱动，如果放在 `__init__.py` 中，任何导入 `vllm.models.deepseek_v4` 的代码（即使只是为了获取模块结构）都会触发 CUDA 驱动初始化。这在 vLLM 的多进程架构（fork 子进程）中会导致崩溃——fork 后的子进程不应该持有 CUDA 上下文。
+2. **调用方需显式 import**：调用 `nvidia/ops/` 下的内核必须通过 `has_cutedsl()` 或 `is_cuda()` 门控后 direct import 具体的 leaf module（如 `from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import ...`）。
+3. **与 `common/ops/__init__.py` 的对比**：`common/ops/` 使用正常的 `__init__.py` 导出（9 个公开符号：8 个函数 + 1 个常量），因为其所有实现都是 Triton 或 PyTorch，不引入 CUDA 驱动依赖，可以在任何平台上安全导入。
+
 ## 相关笔记
 
 - [[SparseAttnCompress]]：同 `nvidia/ops/` 目录的另一 Triton/CuteDSL 内核，共享 FP8 量化模式
@@ -156,3 +179,4 @@ deep_gemm.fp8_fp4_mega_moe (DeepGEMM kernel)
 - [[DeepseekV4MegaMoEExperts]]：`get_symm_buffer` 和 `finalize_weights` 的配套逻辑
 - [[QuantAndParallelStrategy]]：MegaMoE 路径的量化策略（FP4 权重 + FP8 激活）
 - [[DeepseekV4FP8Config]]：`expert_dtype` 控制是否启用 FP4 专家
+- [[common_ops]]：`common/ops/` 的正常导出模式（与 `nvidia/ops/` 的空 `__init__` 对比）

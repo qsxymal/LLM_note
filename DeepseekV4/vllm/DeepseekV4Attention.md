@@ -351,11 +351,11 @@ def forward(
 2. 调用自定义 op `torch.ops.vllm.deepseek_v4_attention`（L296-L301），进入 `attention_impl`。
 3. `attention_impl`（L409-L495）：
    - 调用 `attn_gemm_parallel_execute` 并行执行输入 GEMM（`fused_wqa_wkv` + 可选 compressor/indexer）。
-   - 对 `qr` 和 `kv` 进行 RMSNorm（[[common_ops#fused_q_kv_rmsnorm|`fused_q_kv_rmsnorm`]]）。
+   - 对 `qr` 和 `kv` 进行 RMSNorm（[[common_ops#fused_q_kv_rmsnorm|fused_q_kv_rmsnorm]]）。
    - 根据是否有 Indexer/Compressor，使用 `execute_in_parallel` 或 `maybe_execute_in_parallel` 执行 `wq_b + kv_insert` 与 compressor/indexer 的重叠。
    - 调用 `self.mla_attn(q, kv, positions, output=out)` 执行 FlashMLA 注意力。
 4. 切片取前 `n_local_heads` 个头的输出（L302）：`o = o_padded[:, :self.n_local_heads, :]`。
-5. 输出投影：[[FusedInvRopeFP8Quant|`fused_inv_rope_fp8_quant`]] -> `fp8_einsum(wo_a)` -> `wo_b`（L318-L347）。
+5. 输出投影：[[FusedInvRopeFP8Quant|fused_inv_rope_fp8_quant]] -> `fp8_einsum(wo_a)` -> `wo_b`（L318-L347）。
 
 ---
 
