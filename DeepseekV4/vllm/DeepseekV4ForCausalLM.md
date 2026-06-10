@@ -57,7 +57,7 @@ expert_dtype = getattr(config, "expert_dtype", "fp4")
 从 HuggingFace 配置中读取专家权重的数据类型。DeepSeek V4 checkpoint 有两种变体：
 | 变体 | `expert_dtype` | 专家格式 | 缩放因子格式 |
 |------|---------------|---------|-------------|
-| DeepSeek-V4-Flash | `"fp4"`（默认） | MXFP4 | ue8m0（`float8_e8m0fnu`） |
+| DeepSeek-V4-Flash | `"fp4"`（默认） | FP4（MegaMoE/MXFP4/NVFP4） | ue8m0（`float8_e8m0fnu`） |
 | DeepSeek-V4-Flash-Base | `"fp8"` | FP8 block | float32 |
 
 `getattr(..., "fp4")` 的默认值确保旧 checkpoint 无需修改即可使用。

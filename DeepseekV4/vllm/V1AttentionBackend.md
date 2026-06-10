@@ -86,10 +86,12 @@ forward_mqa()
 
 ### 解码路径（第 210-302 行）
 
+[[DeepseekV4_KVCache_Ops#compute_global_topk_indices_and_lens|compute_global_topk_indices_and_lens]]
+
 ```
 _forward_decode()
   |-- 确定 topk_indices/topk_lens：
-  |     compress_ratio == 4  (C4A)  -> [[DeepseekV4_KVCache_Ops#compute_global_topk_indices_and_lens|compute_global_topk_indices_and_lens]]()（第 234 行）
+  |     compress_ratio == 4  (C4A)  -> compute_global_topk_indices_and_lens()（第 234 行）
   |     compress_ratio == 128 (C128A) -> 在元数据中预计算（第 244 行）
   |-- SWA 索引来自 swa_metadata.decode_swa_indices / decode_swa_lens
   |-- q.unsqueeze(1)  -> (num_decode_tokens, 1, 1, head_dim)
