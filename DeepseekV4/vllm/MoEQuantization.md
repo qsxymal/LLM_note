@@ -323,8 +323,29 @@ self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(self.nvfp4_backend
 | 权重 dtype | float8_e4m3fn |
 | Block size | 可配置（如 128×128） |
 | Scale dtype | float32 |
-| 激活量化 | 动态 per-token-group FP8 |
+| 激活量化 | 动态 per-token FP8（float32 scale，见下方详述） |
 | 参数名 | `w13_weight_scale_inv`, `w2_weight_scale_inv` |
+
+#### 激活量化
+
+激活在 kernel 内部做**动态 per-token FP8 量化**，每 token 独立计算 scale。
+
+```
+输入: x ∈ BF16, shape [num_tokens, hidden_size]
+
+1. amax: 每 token 计算 absmax（沿 hidden 维度）
+   amax[t] = max(|x[t, :]|), t ∈ [0, num_tokens)
+
+2. Scale: 每个 token 一个 float32 scale
+   scale_a[t] = amax[t] / 448.0      # 448 = FP8 E4M3 最大值
+
+3. 量化: 逐 token 缩放后转 FP8
+   x_quant[t, :] = to_fp8_e4m3(x[t, :] / scale_a[t])
+
+结果: x_quant ∈ float8_e4m3fn, scale_a ∈ float32, shape [num_tokens]
+```
+
+**数据通路：** scale_a 不经过 TMA，而是在 kernel 内计算后留在寄存器中，逐 block 与 weight scale 合并反量化。
 
 #### Scale 维度
 
@@ -344,7 +365,7 @@ w2_scale:  (E, ceil(H/128), ceil(I/128))       float32
 ```python
 # Block 反量化：在 K 循环内部逐 block 应用 scale
 accumulator += tl.dot(a_block, b_block) * a_scale[:, None] * b_scale[None, :]
-# a_scale: per-token-group 动态 scale（float32）
+# a_scale: per-token 动态 scale（float32）
 # b_scale: per-block 静态 weight scale（float32）
 ```
 

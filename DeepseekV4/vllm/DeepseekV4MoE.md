@@ -327,33 +327,80 @@ def get_quant_method(self, layer, prefix):
 
 ## 9. 并行策略
 
+MoE 有两条互斥的执行路径，由 `use_mega_moe` 标志控制（`model.py:L465-467`）：
+
+| 路径 | 选择条件 | 专家切分方式 | 适用硬件 |
+|------|---------|-------------|---------|
+| **MegaMoE** | `moe_backend == "deep_gemm_mega_moe"` | **EP 切分** | SM100 Blackwell 专用 |
+| **FusedMoE** | `moe_backend != "deep_gemm_mega_moe"` | **TP 切分** | 通用 GPU |
+
+二者在 `DeepseekV4MoE.__init__` 中通过 `self.use_mega_moe` 互斥（`model.py:L541-544`），当前不支持 TP + EP 混合。
+
 ### 9.1 MegaMoE — 专家并行（EP）
 
 ```python
 self.ep_group = get_ep_group()
 self.ep_size = self.ep_group.world_size
 self.ep_rank = self.ep_group.rank_in_group
+assert config.n_routed_experts % self.ep_size == 0
+
 self.n_local_experts = config.n_routed_experts // self.ep_size
 self.experts_start_idx = self.ep_rank * self.n_local_experts
+self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 ```
 （`model.py:L552-559`）
 
-- EP 比 TP 更适合 MoE：专家权重在不同 rank 间独立，只在 all-to-all 阶段通信。
-- `DeepseekV4MegaMoEExperts` 在 `get_symm_buffer()` 中获取 EP group 的同步缓冲区（`model.py:L319-343`），`deep_gemm.get_symm_buffer_for_mega_moe` 内部使用 `ep_group` 创建通信缓冲区。
-- `fused_topk_bias` 输出的 topk_ids 在所有 rank 上相同（gate 是复制层），后续 DeepGEMM 内核内部根据 `ep_rank` 分发本地专家。
+**切分方式：**
+- `n_routed_experts` 个专家均匀分配到 `ep_size` 个 rank，每个 rank 持有 `n_routed_experts / ep_size` 个专家
+- `experts_start_idx` 标识当前 EP rank 在全局专家列表中的起始索引
+- `DeepseekV4MegaMoEExperts` 的权重第一维都是 `num_local_experts`，`weight_loader` 通过 `_map_global_expert_id` 只加载本 rank 的权重，跳过其他 EP rank（`model.py:L221-237`）
+
+**通信模式 — DeepGEMM 内部 all-to-all：**
+- `deep_gemm.fp8_fp4_mega_moe(...)` 内核内部处理 EP 通信
+- 内核接收所有 EP rank 的 token，通过 all-to-all 将 token 分发到对应专家所在的 rank
+- 计算完成后，再通过 all-to-all 将结果收集回来
+- 这种"内核内部通信"模式减少了显式的通信步骤和同步开销
+
+**EP 的必要性检查：**
+```python
+if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
+    raise NotImplementedError(...)
+```
+（`model.py:L468-473`）
+- DeepGEMM 内核内部集成了 all-to-all 通信和 expert dispatch，假设每个 rank 只持有部分专家
+- 如果不使用 EP，各 rank 持有全部专家权重，就失去了使用 DeepGEMM 的意义
+
+**对称缓冲区（`symm_buffer`）：**
+- `deep_gemm.get_symm_buffer_for_mega_moe` 内部使用 `ep_group` 创建通信缓冲区（`model.py:L319-343`）
+- 包含 `x`、`x_sf`、`topk_idx`、`topk_weights` 等字段，由 `prepare_megamoe_inputs` 填充
 
 ### 9.2 FusedMoE — 张量并行（TP）
 
 ```python
+self.tp_rank = get_tensor_model_parallel_rank()
+assert config.n_routed_experts % self.tp_size == 0
+
 self.n_local_experts = config.n_routed_experts // self.tp_size
 self.experts_start_idx = self.tp_rank * self.n_local_experts
-```
-（`amd/model.py:L182-183`，也是 `nvidia/model.py` FusedMoE 路径）
+self.experts_end_idx = self.experts_start_idx + self.n_local_experts
 
-- 每个 TP rank 持有 `n_routed_experts / tp_size` 个完整专家。
-- FusedMoE 层内部通过 all-reduce 合并各专家的输出。
-- gate 路由网络是复制层（`ReplicatedLinear`），每个 rank 独立计算完整路由。
-- **AMD 路径仅支持 FusedMoE**：`amd/model.py` 中没有 `use_mega_moe` 标志，始终使用 FusedMoE + TP。AMD 不实现 MegaMoE，因为其依赖的 DeepGEMM 内核（含 EP all-to-all）是 NVIDIA SM100 专有的。
+self.experts = FusedMoE(...)
+```
+（`model.py:L578-601`）
+
+**切分方式：**
+- `n_routed_experts` 个专家均匀分配到 `tp_size` 个 rank
+- 每个 TP rank 持有 `n_routed_experts / tp_size` 个完整专家（所有权重维度完整）
+- FusedMoE 层内部通过 all-reduce 跨 TP rank 聚合各专家的输出
+
+**FusedMoE 内部机制：**
+- TP 切分是按"专家维度"切分（每个 rank 持有不同的专家子集），而非按"权重维度"切分（如标准 ColumnParallel）
+- FusedMoE 内核利用 `topk_ids` 在本地选择本 rank 负责的专家进行计算
+- 结果通过 all-reduce 跨 TP rank 合并（因为不同 rank 上的专家对同一 token 的输出需要加总）
+
+**gate 路由（与 EP 相同）：**
+- `GateLinear`（继承自 `ReplicatedLinear`）在所有 rank 上**复制**（`model.py:L495-501`）
+- 每个 rank 独立计算完整的 `router_logits`（shape `[num_tokens, n_routed_experts]`），然后通过 `fused_topk_bias` 得到 `topk_ids`
 
 ### 9.3 共享专家 — TP 策略
 
@@ -367,7 +414,42 @@ self.shared_experts = DeepseekV4MLP(
 （`model.py:L531-538`）
 
 - **MegaMoE 路径**：`is_sequence_parallel=True`，禁用 TP，每个 rank 持有完整共享专家权重。
-- **FusedMoE 路径**：使用标准 TP 切分（gate_up_proj 列切分，down_proj 行切分 + all-reduce）。
+- **FusedMoE 路径**：使用标准 TP 切分（`gate_up_proj` 列切分，`down_proj` 行切分 + all-reduce）。
+
+### 9.4 TP vs EP 对比总结
+
+| 维度 | FusedMoE (TP) | MegaMoE (EP) |
+|------|--------------|-------------|
+| **切分依据** | `tensor_parallel_size` | `ep_size`（由 `--enable-expert-parallel` 启用） |
+| **每个 rank 的专家数** | `n_routed / tp_size` | `n_routed / ep_size` |
+| **通信模式** | FusedMoE 内核内部 dispatch + all-reduce 聚合 | DeepGEMM 内核内部 all-to-all |
+| **权重精度** | FP4/FP8/BF16 可选 | FP4 固定（`assert expert_dtype == "fp4"`） |
+| **激活精度** | BF16（权重反量化后计算） | FP8（`prepare_megamoe_inputs` 动态量化） |
+| **gate** | `ReplicatedLinear`（复制） | `ReplicatedLinear`（复制） |
+| **共享专家** | MergedColumnParallel + RowParallel（TP） | MergedColumnParallel + RowParallel（TP，但 `disable_tp=True`） |
+| **硬件要求** | 通用 GPU | SM100 Blackwell（compute 10.x） |
+| **TP + EP 混合** | 不支持（只有 TP） | **不支持**（当前不嵌套 TP） |
+
+### 9.5 关键设计要点
+
+**1. Gate 总是复制：** 无论 TP 还是 EP，gate 在所有 rank 上复制计算（`model.py:L495-501`）。每个 rank 需要看到完整的 `n_routed_experts` 个 logits 才能做 top-k 选择 — 如果 gate 做列切分，`topk_ids` 在 rank 间会不一致。复制计算看似冗余，但避免了 EP 中 all-gather 路由信息的通信开销。由于 `ReplicatedLinear` 的计算量相对于专家计算很小，复制比通信更高效。
+
+**2. 共享专家总是 TP：** 共享专家的 `gate_up_proj`/`down_proj` 使用标准 TP 切分（MegaMoE 路径下 `disable_tp=True` 是整体禁用）。共享专家不是"专家并行"的 — 所有 token 都要经过共享专家，不存在按专家分配的逻辑。
+
+**3. EP 用 all-to-all，TP 用 all-reduce：**
+- EP 下：token 根据 `topk_ids` 被路由到正确的 EP rank → **all-to-all** 通信模式（DeepGEMM 内核内部）
+- TP 下：FusedMoE 内核利用 `topk_ids` 在本地选择专家计算，然后跨 TP rank **all-reduce** 合并结果
+
+**4. 内存分布差异：**
+- TP 下：每个 rank 持有 `n_routed/tp_size` 个专家 × 全部权重维度，专家按"专家维度"切分
+- EP 下：每个 rank 持有 `n_routed/ep_size` 个专家 × 全部权重维度，切分方式与 TP 相同（按专家数），但通信方式不同（all-to-all vs all-reduce）
+
+**5. TP + EP 不能混合：** 当前设计不支持 TP 和 EP 嵌套。`use_mega_moe` 标志决定使用哪种并行策略，不存在"TP 内嵌 EP"或"EP 内嵌 TP"的配置。DeepGEMM 的 MegaMoE 假设 rank 间只通过 EP all-to-all 通信，不感知 TP 的 all-reduce 维度。
+
+**6. 代码中 `n_local_experts` 的复用在两个路径中含义不同：**
+- FusedMoE 路径：`n_local_experts = n_routed_experts // self.tp_size`（`model.py:L581`）
+- MegaMoE 路径：`n_local_experts = n_routed_experts // self.ep_size`（`model.py:L556`）
+- 相同的变量名，不同的并行维度 — 这是 `model.py` 的一个设计选择，通过 `use_mega_moe` 分支隔离了两者的语义
 
 ---
 
