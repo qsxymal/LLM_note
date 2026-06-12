@@ -414,12 +414,12 @@ self.shared_experts = DeepseekV4MLP(
 
 ### 5.2 所有激活量化格式对比
 
-| 方案 | 量化位置 | 激活 dtype | Scale dtype | Block size |
-|------|---------|-----------|-------------|-----------|
-| MegaMoE 输入 | `prepare_megamoe_inputs` | float8_e4m3 | uint32（打包 4×E8M0） | 128 |
-| FP8 block (FusedMoE) | `fused_experts` 内部 | float8_e4m3 | float32 | 可配 |
-| MXFP4 / NVFP4 W4A16 | 无 | bf16 | — | — |
-| NVFP4 W4A4 | `fused_experts` 内部 | fp4 | float32 | 16 |
+| 方案 | 量化位置 | 激活 dtype | Scale dtype | 实际粒度 | 备注 |
+|------|---------|-----------|-------------|---------|------|
+| MegaMoE 输入 | `prepare_megamoe_inputs` | float8_e4m3 | uint32（打包 4×E8M0） | 32（子分组）→ 128（打包） | |
+| FP8 block (FusedMoE) | `fused_experts` 内部 | float8_e4m3 | float32 | per-token（精确） | scale 留在寄存器 |
+| MXFP4 / NVFP4 W4A16 | 无 | bf16 | — | — | 激活不量化 |
+| NVFP4 W4A4 | `fused_experts` 内部 | fp4 | float32（动态 per-16-group）+ float32（静态 per-tensor input_scale） | 16 | kernel 内 per-group + 全局 input_scale 偏置 |
 
 ### 5.3 E8M0 格式在系统中的应用
 
@@ -515,6 +515,16 @@ hidden_states [T, H] bf16
 - FP4: 256 × 1 × 4096 × 12288 × 2 bytes ≈ 24 GB（节省 72 GB）
 
 ---
+
+个人认为主要的几个点：
+* QAT：原始精度转FP4，再转FP8进行训练，模拟FP4量化
+* SwiGLU clamping：适应FP4的精度范围
+* Anticipatory routing：gate的权重用历史时刻的，非当前最新的
+
+---
+
+
+> **注：** FP4 QAT 训练方法及激活量化 Outlier 处理已移至 [[QuantAndParallelStrategy]] §7-§8。
 
 ## 相关笔记
 
